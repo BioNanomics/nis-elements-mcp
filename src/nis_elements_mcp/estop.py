@@ -67,15 +67,16 @@ import subprocess
 import sys
 from pathlib import Path
 
+from nis_elements_mcp import settings
+
 #: Absolute and machine-wide. Never derive this from the working
 #: directory - see the module header.
-ESTOP_PATH = Path(os.environ.get("CONFOCAL_ESTOP_FILE",
-                                 Path.home() / ".confocal-mcp" / "ESTOP"))
+ESTOP_PATH: Path = settings.estop_file()      # NIS_ESTOP_FILE, else ~/.nis-mcp/ESTOP
 
 
 #: Held by the running STOP panel for its whole life, so every process can
 #: tell whether one is already on screen. Windows frees it if the panel dies.
-PANEL_MUTEX = r"Local\confocal-mcp-estop-panel"
+PANEL_MUTEX = r"Local\nis-mcp-estop-panel"
 
 
 class EStopEngaged(RuntimeError):
@@ -165,9 +166,9 @@ def launch_panel() -> None:
 
     Detached, not a child: the panel must outlive this process. Failures
     go to stderr - never stdout, which is the MCP JSON-RPC channel - and
-    never stop the caller. CONFOCAL_NO_ESTOP_PANEL=1 turns it off.
+    never stop the caller. NIS_NO_ESTOP_PANEL=1 turns it off.
     """
-    if os.environ.get("CONFOCAL_NO_ESTOP_PANEL"):
+    if settings.estop_panel_disabled():
         return
     try:
         if panel_running():

@@ -13,8 +13,10 @@
 #     (PermissionError otherwise)
 #   * the e-stop is checked in the client before a request is sent, and
 #     again inside NIS by the bridge
-#   * XY moves are relative and capped at 1 mm; there is no Z tool
-#   * objective changes are limited to 4x/10x by the bridge
+#   * XY moves are relative and capped (NIS_MAX_STEP_UM, default 1 mm);
+#     there is no Z tool
+#   * objective changes only to NIS_ALLOWED_OBJECTIVES (default 4x/10x)
+#   * ND runs only of NIS_ALLOWED_EXPERIMENTS, if that is set
 #   * captures are written only under the data folder, by file name - a
 #     chat prompt cannot choose an arbitrary path
 #   * nis_finish_experiment and estop never need confirm: they only stop
@@ -24,11 +26,11 @@
 from __future__ import annotations
 
 import json
-import os
 import re
 from pathlib import Path
 
 from nis_elements_mcp import estop as _estop
+from nis_elements_mcp import settings
 from nis_elements_mcp.nis_bridge_client import NISBridge
 
 
@@ -57,7 +59,7 @@ def _checked(result: dict) -> dict:
 
 def capture_dir() -> Path:
     """Where nis_capture writes: NIS_CAPTURE_DIR, else ~/nis-mcp/captures."""
-    d = Path(os.environ.get("NIS_CAPTURE_DIR") or Path.home() / "nis-mcp" / "captures")
+    d = settings.capture_dir()
     d.mkdir(parents=True, exist_ok=True)
     return d
 
@@ -72,7 +74,8 @@ def nis_status() -> dict:
 
 def nis_move_relative(dx_um: float, dy_um: float, confirm: bool = False) -> dict:
     """Move the XY stage by (dx_um, dy_um) microns RELATIVE to where it is,
-    through NIS-Elements. At most 1000 um per axis per call. Returns the
+    through NIS-Elements. At most 1000 um per axis per call (or the
+    NIS_MAX_STEP_UM setting). Returns the
     position before and after - treat 'after_um' as ground truth.
     Requires confirm=True. Z cannot be moved from here."""
     _require_confirm(confirm, "nis_move_relative")
@@ -83,7 +86,8 @@ def nis_change_objective(name: str, confirm: bool = False) -> dict:
     """Switch objective in NIS-Elements. `name` must be the exact name
     nis_status lists under nosepiece_objectives, and only 4x or 10x
     objectives are accepted (long working distance - they cannot reach
-    the sample). Returns the objective and nosepiece position before and
+    the sample), unless NIS_ALLOWED_OBJECTIVES says otherwise. Returns
+    the objective and nosepiece position before and
     after. Requires confirm=True."""
     _require_confirm(confirm, "nis_change_objective")
     return _checked(_bridge().change_objective(name))
@@ -117,7 +121,8 @@ def nis_run_experiment(experiment: str, confirm: bool = False) -> dict:
     ND Acquisition window, by its saved name. It runs with exactly the
     saved settings (time loop, channels, save-to-file path). The call may
     not return until the experiment ends. Refused if one is already
-    running. Requires confirm=True."""
+    running, or if NIS_ALLOWED_EXPERIMENTS is set and does not list it.
+    Requires confirm=True."""
     _require_confirm(confirm, "nis_run_experiment")
     return _checked(_bridge().nd_run(experiment))
 

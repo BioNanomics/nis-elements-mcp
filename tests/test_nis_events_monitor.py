@@ -62,7 +62,6 @@ def test_optical_configs_are_get_only_and_not_logged(bridge, events_log):
 
 def test_cli_lists_optical_configs(bridge, capsys, monkeypatch):
     nis, url, c = bridge
-    monkeypatch.setenv("CONFOCAL_NIS_BRIDGE_URL", url)
     monkeypatch.setattr(sys, "argv", ["nis_bridge", "optconfs"])
     client_mod.main()
     assert "All Devices" in capsys.readouterr().out
@@ -192,7 +191,7 @@ def test_fetch_status_treats_a_garbled_answer_as_down(monkeypatch):
 def test_monitor_launch_does_nothing_off_windows(monkeypatch):
     opened = []
     monkeypatch.setattr(monitor.subprocess, "Popen", lambda *a, **k: opened.append(a))
-    monkeypatch.delenv("CONFOCAL_NO_NIS_MONITOR", raising=False)
+    monkeypatch.delenv("NIS_NO_MONITOR", raising=False)
     monkeypatch.setattr(monitor, "ON_WINDOWS", False)
     monitor.launch()
     assert opened == []
@@ -203,7 +202,7 @@ def test_monitor_launch_failure_is_reported_not_raised(monkeypatch, capsys):
         raise OSError("no console")
 
     monkeypatch.setattr(monitor.subprocess, "Popen", boom)
-    monkeypatch.delenv("CONFOCAL_NO_NIS_MONITOR", raising=False)
+    monkeypatch.delenv("NIS_NO_MONITOR", raising=False)
     monkeypatch.setattr(monitor, "ON_WINDOWS", True)
     monkeypatch.setattr(monitor, "monitor_running", lambda: False)
     monitor.launch()

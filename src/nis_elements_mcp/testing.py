@@ -167,7 +167,8 @@ def bridge(estop_file, monkeypatch):
     t.start()
     assert ready.wait(5)
     url = f"http://127.0.0.1:{port[0]}"
-    monkeypatch.setenv("CONFOCAL_NIS_BRIDGE_URL", url)
+    monkeypatch.setenv("NIS_BRIDGE_HOST", "127.0.0.1")
+    monkeypatch.setenv("NIS_BRIDGE_PORT", str(port[0]))
     nis.ui = ui
     yield nis, url, client_mod.NISBridge(url)
     stop.set()

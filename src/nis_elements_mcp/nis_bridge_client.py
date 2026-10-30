@@ -23,23 +23,24 @@
 # (nis_events.py), which `python -m nis_elements_mcp.nis_monitor`
 # shows live. Status reads are not logged (the monitor polls them).
 #
-# CONFOCAL_NIS_BRIDGE_URL overrides the address (default
-# http://127.0.0.1:8766).
+# NIS_BRIDGE_HOST / NIS_BRIDGE_PORT set the address (default
+# http://127.0.0.1:8766). The XY step limit, the objective allow-list and
+# the ND experiment allow-list (settings.py) are checked here before
+# anything is sent, and the bridge checks its own copy of the first two.
 # ------------------------------------------------------------
 
 from __future__ import annotations
 
 import argparse
 import json
-import os
 import sys
 import time
 import urllib.error
 import urllib.request
 
-from nis_elements_mcp import estop, nis_events
+from nis_elements_mcp import estop, nis_events, settings
+from nis_elements_mcp.nis_bridge_job import magnification
 
-DEFAULT_URL = "http://127.0.0.1:8766"
 
 
 class BridgeUnavailable(RuntimeError):
@@ -48,7 +49,7 @@ class BridgeUnavailable(RuntimeError):
 
 class NISBridge:
     def __init__(self, url: str | None = None, timeout_s: float = 30.0):
-        self.url = (url or os.environ.get("CONFOCAL_NIS_BRIDGE_URL") or DEFAULT_URL).rstrip("/")
+        self.url = (url or settings.bridge_url()).rstrip("/")
         self.timeout_s = timeout_s
 
     def _call(self, method: str, path: str, body: dict | None = None,
@@ -99,11 +100,13 @@ class NISBridge:
     # Motion / acquisition: e-stop checked before anything is sent
     def move_relative(self, dx_um: float, dy_um: float) -> dict:
         return self._act("move", {"dx": dx_um, "dy": dy_um},
-                         lambda: self._call("POST", "/move", {"dx": dx_um, "dy": dy_um}))
+                         lambda: _step_refusal(dx_um, dy_um)
+                         or self._call("POST", "/move", {"dx": dx_um, "dy": dy_um}))
 
     def change_objective(self, name: str) -> dict:
         return self._act("objective", {"name": name},
-                         lambda: self._call("POST", "/objective", {"name": name}))
+                         lambda: _objective_refusal(name)
+                         or self._call("POST", "/objective", {"name": name}))
 
     def capture(self, path: str) -> dict:
         return self._act("capture", {"path": path},
@@ -113,8 +116,9 @@ class NISBridge:
         # ND_RunExperiment may block until the run ends (unverified), so
         # the answer can take as long as the run itself.
         return self._act("nd_run", {"experiment": experiment},
-                         lambda: self._call("POST", "/nd/run", {"experiment": experiment},
-                                            timeout_s=timeout_s))
+                         lambda: _experiment_refusal(experiment)
+                         or self._call("POST", "/nd/run", {"experiment": experiment},
+                                       timeout_s=timeout_s))
 
     # Always allowed: these only end things
     def nd_finish(self) -> dict:
@@ -124,14 +128,40 @@ class NISBridge:
         return self._act("shutdown", {}, lambda: self._call("POST", "/shutdown"), guarded=False)
 
 
+# The limits from settings.py, checked before a request leaves this process.
+# Each returns the refusal, shaped like the bridge's own, or None.
+
+def _step_refusal(dx_um: float, dy_um: float) -> dict | None:
+    limit = settings.max_step_um()
+    if max(abs(dx_um), abs(dy_um)) > limit:
+        return {"error": f"step over {limit:g} um refused (NIS_MAX_STEP_UM)"}
+    return None
+
+
+def _objective_refusal(name: str) -> dict | None:
+    allowed = settings.allowed_magnifications()
+    if magnification(name) not in allowed:
+        listed = "/".join(f"{m:g}x" for m in allowed)
+        return {"error": f"only {listed} objectives are allowed (NIS_ALLOWED_OBJECTIVES), got {name!r}"}
+    return None
+
+
+def _experiment_refusal(experiment: str) -> dict | None:
+    allowed = settings.allowed_experiments()
+    if allowed is not None and experiment not in allowed:
+        return {"error": f"ND experiment {experiment!r} is not in NIS_ALLOWED_EXPERIMENTS "
+                         f"({', '.join(allowed)})"}
+    return None
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description="Talk to the NIS bridge job by hand.")
-    ap.add_argument("--url", help=f"bridge address (default {DEFAULT_URL})")
+    ap.add_argument("--url", help="bridge address (default from NIS_BRIDGE_HOST/PORT, else http://127.0.0.1:8766)")
     sub = ap.add_subparsers(dest="cmd", required=True)
     sub.add_parser("status")
-    m = sub.add_parser("move", help="relative XY move in um (max 1000 per axis)")
+    m = sub.add_parser("move", help="relative XY move in um (max NIS_MAX_STEP_UM per axis, default 1000)")
     m.add_argument("dx", type=float); m.add_argument("dy", type=float)
-    o = sub.add_parser("objective", help="exact name as listed by status (4x/10x only)")
+    o = sub.add_parser("objective", help="exact name as listed by status (NIS_ALLOWED_OBJECTIVES, default 4x/10x)")
     o.add_argument("name")
     sub.add_parser("optconfs", help="list the optical configurations")
     c = sub.add_parser("capture", help="capture one image and save it as .nd2")

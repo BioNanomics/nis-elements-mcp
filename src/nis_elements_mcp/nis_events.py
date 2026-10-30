@@ -21,15 +21,16 @@ from __future__ import annotations
 
 import datetime
 import json
-import os
 from pathlib import Path
+
+from nis_elements_mcp import settings
 
 PHASES = ("start", "ok", "failed", "refused", "error")
 
 
 def events_dir() -> Path:
     """NIS_LOG_DIR, else ~/nis-mcp/logs. Read on every call, so a change takes effect at once."""
-    return Path(os.environ.get("NIS_LOG_DIR") or Path.home() / "nis-mcp" / "logs")
+    return settings.log_dir()
 
 
 def events_path(day: datetime.date | None = None) -> Path:

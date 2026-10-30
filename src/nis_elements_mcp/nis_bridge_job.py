@@ -56,8 +56,8 @@ except ImportError:          # off the microscope (tests): the module is only ne
 #   * nothing moves or starts while the e-stop file exists (the same file
 #     estop.py uses)
 #   * XY moves are relative and capped at MAX_STEP_UM; Z is never moved
-#   * objective changes only to 4x/10x names (ALLOWED_MAGNIFICATIONS):
-#     working distances of 20 and 4 mm cannot reach the dish
+#   * objective changes only to ALLOWED_MAGNIFICATIONS (default 4x/10x,
+#     whose working distances of 20 and 4 mm cannot reach the dish)
 #   * serves on 127.0.0.1 only
 # ------------------------------------------------------------
 import ctypes as ct
@@ -70,16 +70,43 @@ import threading
 import time
 from pathlib import Path
 
-PORT = 8766                     # 8765 is the plain port probe (nis_port_probe.py)
+# Settings. Inside NIS they come from NIS's own environment, which is
+# usually empty, so the defaults apply. To change one, set the variable
+# (NIS_BRIDGE_PORT, NIS_MAX_STEP_UM, NIS_ALLOWED_OBJECTIVES, NIS_ESTOP_FILE)
+# before starting NIS, or edit the default here before pasting the file.
+# The client side (settings.py) uses the same names and defaults.
+DEFAULT_HOST = "127.0.0.1"
+DEFAULT_PORT = 8766             # 8765 is the plain port probe (nis_port_probe.py)
+DEFAULT_MAX_STEP_UM = 1000.0
+DEFAULT_ALLOWED_OBJECTIVES = "4,10"    # long working distances: they cannot reach the dish
 VERSION = 1
-MAX_STEP_UM = 1000.0
-ALLOWED_MAGNIFICATIONS = (4, 10)
 UI_TICK_MS = 50                 # how often NIS's main thread looks for queued UI calls
 UI_CALL_TIMEOUT_S = 600.0       # give up waiting for the main thread after this long
 # "4x" / "10x" as a whole magnification - not the 4x inside "14x" or "40x"
 _MAG = re.compile(r"(?<![\d.])(\d+(?:\.\d+)?)\s*[xX](?![a-zA-Z0-9])")
-ESTOP = Path(os.environ.get("CONFOCAL_ESTOP_FILE",
-                            Path.home() / ".confocal-mcp" / "ESTOP"))
+
+
+def parse_magnifications(text: str) -> "tuple[float, ...]":
+    """'4,10' or '4x, 10x' -> (4.0, 10.0)."""
+    return tuple(float(p.strip().rstrip("xX")) for p in text.split(",") if p.strip())
+
+
+def magnification(name: str) -> "float | None":
+    """The one magnification in an objective name ('PLAN APO 10x' -> 10.0), else None."""
+    mags = {float(m) for m in _MAG.findall(name)}
+    return mags.pop() if len(mags) == 1 else None
+
+
+def estop_file() -> Path:
+    """NIS_ESTOP_FILE, else ~/.nis-mcp/ESTOP: absolute, the same for every process."""
+    return Path(os.environ.get("NIS_ESTOP_FILE", "").strip() or Path.home() / ".nis-mcp" / "ESTOP")
+
+
+PORT = int(os.environ.get("NIS_BRIDGE_PORT", "").strip() or DEFAULT_PORT)
+MAX_STEP_UM = float(os.environ.get("NIS_MAX_STEP_UM", "").strip() or DEFAULT_MAX_STEP_UM)
+ALLOWED_MAGNIFICATIONS = parse_magnifications(os.environ.get("NIS_ALLOWED_OBJECTIVES", "").strip()
+                                              or DEFAULT_ALLOWED_OBJECTIVES)
+ESTOP = estop_file()
 
 IDLE_STOP_S = 4 * 3600.0        # end the job if nothing has asked for this long
 TURRET_SETTLE_S = 25.0          # how long to wait for the nosepiece to arrive
@@ -237,9 +264,9 @@ class Bridge:
     def objective(self, name: str) -> dict:
         if (r := self._refuse_if_stopped("objective change")):
             return r
-        mags = {float(m) for m in _MAG.findall(name)}
-        if len(mags) != 1 or mags.pop() not in ALLOWED_MAGNIFICATIONS:
-            return {"error": f"only {ALLOWED_MAGNIFICATIONS}x objectives are allowed, got {name!r}"}
+        if magnification(name) not in ALLOWED_MAGNIFICATIONS:
+            allowed = "/".join(f"{m:g}x" for m in ALLOWED_MAGNIFICATIONS)
+            return {"error": f"only {allowed} objectives are allowed, got {name!r}"}
         before = self.status()
         # Two separate things, both needed (seen on the scope 2026-10-13/14):
         # Stg_SetNosepiecePosition turns the turret but NIS's objective name

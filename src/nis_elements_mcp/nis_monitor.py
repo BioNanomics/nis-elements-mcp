@@ -13,7 +13,7 @@
 # It also opens by itself in its own console window when the NIS MCP server
 # starts (launch(), same pattern as the STOP panel) - you should not have to
 # remember it. One window only: a named mutex stops a second copy.
-# CONFOCAL_NO_NIS_MONITOR=1 turns the automatic launch off.
+# NIS_NO_MONITOR=1 turns the automatic launch off.
 #
 # While the bridge is busy with one long NIS call (an ND run or a capture
 # blocks the bridge's single worker) /status cannot answer, so the monitor
@@ -33,11 +33,10 @@ import time
 import urllib.error
 import urllib.request
 
-from nis_elements_mcp import estop, nis_events
-from nis_elements_mcp.nis_bridge_client import DEFAULT_URL
+from nis_elements_mcp import estop, nis_events, settings
 
 ON_WINDOWS = sys.platform == "win32"
-MONITOR_MUTEX = r"Local\confocal-mcp-nis-monitor"
+MONITOR_MUTEX = r"Local\nis-mcp-monitor"
 STATUS_TIMEOUT_S = 2.0
 EVENTS_KEPT = 200
 
@@ -65,7 +64,7 @@ def launch() -> None:
     the server; failures go to stderr (stdout is the MCP JSON-RPC channel)
     and never stop the caller.
     """
-    if os.environ.get("CONFOCAL_NO_NIS_MONITOR") or not ON_WINDOWS:
+    if settings.monitor_disabled() or not ON_WINDOWS:
         return
     try:
         if monitor_running():
@@ -157,7 +156,7 @@ def render(link: str, status: dict | None, events: list[dict], estop_text: str,
 
 def main() -> None:
     ap = argparse.ArgumentParser(description="Live terminal view of the NIS bridge.")
-    ap.add_argument("--url", default=os.environ.get("CONFOCAL_NIS_BRIDGE_URL", DEFAULT_URL))
+    ap.add_argument("--url", default=settings.bridge_url())
     ap.add_argument("--interval", type=float, default=1.0, help="seconds between refreshes")
     ap.add_argument("--once", action="store_true", help="print one snapshot and exit")
     a = ap.parse_args()

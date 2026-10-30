@@ -15,7 +15,7 @@ from mcp.server.mcpserver import MCPServer
 
 from nis_elements_mcp import estop, nis_monitor, nis_tools
 
-mcp = MCPServer("ConfocalOrchestrator-NIS")
+mcp = MCPServer("NIS-Elements")
 
 mcp.add_tool(nis_tools.nis_status)
 mcp.add_tool(nis_tools.nis_move_relative)

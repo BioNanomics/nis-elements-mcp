@@ -163,7 +163,7 @@ def test_nis_server_exposes_exactly_the_nis_tools(tmp_path):
     from mcp.client.stdio import StdioServerParameters, stdio_client
 
     async def names():
-        env = dict(os.environ, CONFOCAL_NO_ESTOP_PANEL="1", CONFOCAL_NO_NIS_MONITOR="1",
+        env = dict(os.environ, NIS_NO_ESTOP_PANEL="1", NIS_NO_MONITOR="1",
                    NIS_LOG_DIR=str(tmp_path / "logs"), NIS_CAPTURE_DIR=str(tmp_path / "caps"))
         params = StdioServerParameters(command=sys.executable, args=["-m", "nis_elements_mcp.nis_server"], env=env)
         async with Client(stdio_client(params)) as client:
@@ -284,7 +284,7 @@ def test_monitor_says_busy_when_the_bridge_connects_but_does_not_answer():
 def test_monitor_opens_once_when_the_server_starts(monkeypatch):
     opened = []
     monkeypatch.setattr(monitor.subprocess, "Popen", lambda *a, **k: opened.append(a[0]))
-    monkeypatch.delenv("CONFOCAL_NO_NIS_MONITOR", raising=False)
+    monkeypatch.delenv("NIS_NO_MONITOR", raising=False)
     monkeypatch.setattr(monitor, "monitor_running", lambda: False)
     monkeypatch.setattr(monitor, "ON_WINDOWS", True)        # the launch is Windows-only; CI runs on Linux
     monitor.launch()
@@ -293,7 +293,7 @@ def test_monitor_opens_once_when_the_server_starts(monkeypatch):
     monkeypatch.setattr(monitor, "monitor_running", lambda: True)       # already on screen
     monitor.launch()
     monkeypatch.setattr(monitor, "monitor_running", lambda: False)
-    monkeypatch.setenv("CONFOCAL_NO_NIS_MONITOR", "1")                  # switched off
+    monkeypatch.setenv("NIS_NO_MONITOR", "1")                  # switched off
     monitor.launch()
     assert opened == []
 

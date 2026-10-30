@@ -62,9 +62,9 @@ def test_panel_not_running_off_windows(monkeypatch):
 def test_launch_panel_opt_out_and_already_running(monkeypatch):
     opened = []
     monkeypatch.setattr(estop.subprocess, "Popen", lambda *a, **k: opened.append(a))
-    monkeypatch.setenv("CONFOCAL_NO_ESTOP_PANEL", "1")
+    monkeypatch.setenv("NIS_NO_ESTOP_PANEL", "1")
     estop.launch_panel()
-    monkeypatch.delenv("CONFOCAL_NO_ESTOP_PANEL")
+    monkeypatch.delenv("NIS_NO_ESTOP_PANEL")
     monkeypatch.setattr(estop, "panel_running", lambda: True)
     estop.launch_panel()
     assert opened == []
@@ -72,7 +72,7 @@ def test_launch_panel_opt_out_and_already_running(monkeypatch):
 
 def test_launch_panel_starts_detached_process(monkeypatch):
     opened = []
-    monkeypatch.delenv("CONFOCAL_NO_ESTOP_PANEL", raising=False)
+    monkeypatch.delenv("NIS_NO_ESTOP_PANEL", raising=False)
     monkeypatch.setattr(estop, "panel_running", lambda: False)
     monkeypatch.setattr(estop.subprocess, "Popen", lambda *a, **k: opened.append(a[0]))
     estop.launch_panel()
@@ -83,7 +83,7 @@ def test_launch_panel_failure_goes_to_stderr(monkeypatch, capsys):
     def boom(*a, **k):
         raise OSError("nope")
 
-    monkeypatch.delenv("CONFOCAL_NO_ESTOP_PANEL", raising=False)
+    monkeypatch.delenv("NIS_NO_ESTOP_PANEL", raising=False)
     monkeypatch.setattr(estop, "panel_running", lambda: False)
     monkeypatch.setattr(estop.subprocess, "Popen", boom)
     estop.launch_panel()
