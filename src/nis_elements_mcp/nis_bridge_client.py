@@ -1,18 +1,19 @@
-# nis_bridge.py
+# nis_bridge_client.py
 # ------------------------------------------------------------
 # Client for the NIS bridge (nis_bridge_job.py), the
 # JOBS task that exposes NIS-Elements macro calls on 127.0.0.1:8766 while
 # it runs. Used by the NIS MCP server; also a command line for testing by
-# hand:
+# hand (`nis-mcp-bridge`, or `python -m nis_elements_mcp.nis_bridge_client`):
 #
-#   python -m nis_elements_mcp.nis_bridge_client status
-#   python -m nis_elements_mcp.nis_bridge_client move 100 0
-#   python -m nis_elements_mcp.nis_bridge_client objective "Plan Fluor 10x Ph1 DLL"
-#   python -m nis_elements_mcp.nis_bridge_client optconfs
-#   python -m nis_elements_mcp.nis_bridge_client capture D:\...\check.nd2
-#   python -m nis_elements_mcp.nis_bridge_client nd-run "C. elegans 3h"
-#   python -m nis_elements_mcp.nis_bridge_client nd-finish
-#   python -m nis_elements_mcp.nis_bridge_client shutdown
+#   nis-mcp-bridge job-file        # where the file to paste into NIS is
+#   nis-mcp-bridge status
+#   nis-mcp-bridge move 100 0
+#   nis-mcp-bridge objective "Plan Fluor 10x Ph1 DLL"
+#   nis-mcp-bridge optconfs
+#   nis-mcp-bridge capture D:\...\check.nd2
+#   nis-mcp-bridge nd-run "C. elegans 3h"
+#   nis-mcp-bridge nd-finish
+#   nis-mcp-bridge shutdown         # the ONLY safe way to stop the bridge job
 #
 # The e-stop is checked HERE as well as in the bridge: a refused request
 # never leaves this process, so a stopped microscope does not depend on
@@ -20,7 +21,7 @@
 # shutting the bridge down are always allowed - they only end things.
 #
 # Every action here is also written to the NIS event log
-# (nis_events.py), which `python -m nis_elements_mcp.nis_monitor`
+# (nis_events.py), which `nis-mcp-monitor`
 # shows live. Status reads are not logged (the monitor polls them).
 #
 # NIS_BRIDGE_HOST / NIS_BRIDGE_PORT set the address (default
@@ -37,8 +38,10 @@ import sys
 import time
 import urllib.error
 import urllib.request
+from pathlib import Path
 
 from nis_elements_mcp import estop, nis_events, settings
+from nis_elements_mcp import nis_bridge_job
 from nis_elements_mcp.nis_bridge_job import magnification
 
 
@@ -154,6 +157,11 @@ def _experiment_refusal(experiment: str) -> dict | None:
     return None
 
 
+def job_file() -> Path:
+    """The bridge job to paste into a NIS JOBS Python task (nis_bridge_job.py)."""
+    return Path(nis_bridge_job.__file__).resolve()
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description="Talk to the NIS bridge job by hand.")
     ap.add_argument("--url", help="bridge address (default from NIS_BRIDGE_HOST/PORT, else http://127.0.0.1:8766)")
@@ -170,7 +178,11 @@ def main() -> None:
     r.add_argument("experiment")
     sub.add_parser("nd-finish", help="end the running ND experiment after this loop")
     sub.add_parser("shutdown", help="stop the bridge job")
+    sub.add_parser("job-file", help="print the path of the file to paste into the NIS JOBS task")
     a = ap.parse_args()
+    if a.cmd == "job-file":
+        print(job_file())
+        return
 
     b = NISBridge(a.url)
     try:

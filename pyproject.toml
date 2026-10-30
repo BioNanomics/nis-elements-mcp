@@ -7,7 +7,16 @@ name = "nis-elements-mcp"
 version = "0.1.0"
 description = "MCP server that drives a Nikon NIS-Elements microscope through a bridge job running inside NIS"
 readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Qurratul Ain Quais" }]
 requires-python = ">=3.11"
+keywords = ["mcp", "microscopy", "nikon", "nis-elements"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Operating System :: Microsoft :: Windows",
+    "Topic :: Scientific/Engineering :: Image Processing",
+]
 dependencies = [
     "mcp>=2.0,<3",
 ]
@@ -16,7 +25,10 @@ dependencies = [
 test = ["pytest>=8"]
 
 [project.scripts]
-nis-mcp = "nis_elements_mcp.nis_server:main"
+nis-mcp = "nis_elements_mcp.nis_server:main"                  # the MCP server
+nis-mcp-bridge = "nis_elements_mcp.nis_bridge_client:main"    # talk to the bridge by hand; job-file, shutdown
+nis-mcp-estop = "nis_elements_mcp.estop:main"                 # engage / status / release
+nis-mcp-monitor = "nis_elements_mcp.nis_monitor:main"         # live view of the bridge
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/nis_elements_mcp"]
