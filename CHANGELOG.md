@@ -26,7 +26,12 @@ First release, extracted from the microscope-agent project.
 - `nis_elements_mcp.testing`: a fake NIS and a pytest fixture for tests
   without a microscope.
 
+### Fixed
+- `ND_LoadExperiment`'s return code is reported, not treated as a failure:
+  it has no documented value and returned 0 for a template that loads.
+
 ### Known limits
-- ND runs (`nis_run_experiment`, `nis_finish_experiment`) are not yet checked
-  on a microscope.
+- An ND run blocks the bridge until it ends, so `nis_finish_experiment`
+  cannot end a run early yet (checked on the microscope 2026-10-30).
 - The optical configuration cannot be selected through the bridge.
+- The STOP and monitor windows close when the MCP client disconnects.

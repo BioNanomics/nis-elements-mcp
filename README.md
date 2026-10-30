@@ -22,67 +22,101 @@ nis_bridge_job.py       JOBS Python task, runs inside nis_ar.exe
 NIS macro functions     StgMoveXY, Capture, ND_RunExperiment, ...
 ```
 
-Tested on NIS-Elements AR with a Nikon Ti2 stand and an AX confocal (status,
-optical configurations, XY moves, objective changes and capture). ND runs are
-implemented and covered by tests but not yet checked on a microscope.
+Tested on NIS-Elements AR with a Nikon Ti2 stand and an AX confocal: status,
+optical configurations, XY moves, objective changes, capture, the e-stop and
+ND runs. Ending an ND run early is not yet possible (see Known limits).
 
 ## Requirements
 
 - Windows, with NIS-Elements and its **JOBS** module (Python task).
 - Python 3.11 or newer on the same PC, for the MCP server.
-- The bridge job itself needs nothing installed inside NIS: it uses only the
-  Python standard library.
+- Claude Code, if you want to use it from Claude.
+- The bridge job needs nothing installed inside NIS: it uses only the Python
+  standard library.
 
-## Install into a project
+## Setup, step by step
 
-From the project folder, in PowerShell:
+Run the commands in **PowerShell**, in your project's folder.
+
+### Step 1. Create a Python environment for the server
 
 ```powershell
 python -m venv .nis-mcp-env
+```
+
+> If this fails with "The filename or extension is too long" (WinError 206),
+> your project folder's path is too deep for Windows' 260-character limit.
+> Use a shorter folder, or turn on long paths in Windows.
+
+### Step 2. Install the package
+
+```powershell
 .nis-mcp-env\Scripts\pip install "git+https://github.com/BioNanomics/microscope-agent#subdirectory=packages/nis-elements-mcp"
+```
+
+> From a local copy instead of GitHub:
+> `.nis-mcp-env\Scripts\pip install D:\path\to\microscope-agent\packages\nis-elements-mcp`
+
+### Step 3. Register the server with Claude Code
+
+```powershell
 claude mcp add nis --scope local -- "$PWD\.nis-mcp-env\Scripts\nis-mcp.exe"
 ```
 
-- If `python -m venv` or `pip install` fails with "The filename or extension
-  is too long" (WinError 206), the project folder's path is too deep for
-  Windows' 260-character limit: use a shorter folder, or turn on long paths
-  in Windows.
-- Instead of the git URL you can give a local path, e.g.
-  `.nis-mcp-env\Scripts\pip install D:\path\to\microscope-agent\packages\nis-elements-mcp`.
-- The full path (`$PWD\...`) makes the server start whatever folder Claude is
-  launched from.
-- Pass settings with `-e`, before the `--`:
-  ```powershell
-  claude mcp add nis --scope local -e NIS_CAPTURE_DIR=D:\data\nis\captures -e NIS_LOG_DIR=D:\data\nis\logs -- "$PWD\.nis-mcp-env\Scripts\nis-mcp.exe"
-  ```
-- With [uv](https://docs.astral.sh/uv/), one line installs and registers it:
-  ```powershell
-  claude mcp add nis --scope local -- uvx --from "git+https://github.com/BioNanomics/microscope-agent#subdirectory=packages/nis-elements-mcp" nis-mcp
-  ```
+> - `$PWD\...` puts in the full path, so the server starts whatever folder
+>   Claude is launched from.
+> - To choose your own folders or limits, add `-e NAME=value` before the `--`
+>   (all names are in [Settings](#settings)):
+>   ```powershell
+>   claude mcp add nis --scope local -e NIS_CAPTURE_DIR=D:\data\nis\captures -e NIS_LOG_DIR=D:\data\nis\logs -- "$PWD\.nis-mcp-env\Scripts\nis-mcp.exe"
+>   ```
+> - With [uv](https://docs.astral.sh/uv/), one line replaces Steps 1 to 3:
+>   ```powershell
+>   claude mcp add nis --scope local -- uvx --from "git+https://github.com/BioNanomics/microscope-agent#subdirectory=packages/nis-elements-mcp" nis-mcp
+>   ```
 
-## Set up the bridge in NIS
+### Step 4. Start the microscope and NIS
 
-1. Switch on the microscope stand, then start NIS-Elements.
-2. Find the file to paste:
+Switch on the microscope stand first, then start NIS-Elements.
+
+### Step 5. Put the bridge job into NIS (once, and again after each upgrade)
+
+1. Print the path of the file to paste:
    ```powershell
    .nis-mcp-env\Scripts\nis-mcp-bridge job-file
    ```
-3. In NIS, open **JOBS**, create a job with one **Python** task, replace the
-   task's code with the whole of that file, and save the job (for example as
-   `NIS bridge`).
-4. Run the job. Its log shows
-   `NIS bridge v1 listening on 127.0.0.1:8766, pid <NIS pid>`. The job window
-   closes at once; the bridge keeps serving in the background.
-5. Check it: `.nis-mcp-env\Scripts\nis-mcp-bridge status`.
+2. Open that file in a text editor and copy all of it. Its first line is
+   `# IMPORTANT: 'limjob' must be imported like this (not from nor as)`.
+3. In NIS, open **JOBS** and create a job with one **Python** task.
+4. Replace the task's code with what you copied (Ctrl+A, Ctrl+V).
+5. Save the job, for example as `NIS bridge`.
 
-**Stop the bridge only with**
+### Step 6. Run the bridge and check it
+
+1. Run the job in NIS. The job window closes at once; the bridge keeps
+   running in the background.
+2. Check that it answers:
+   ```powershell
+   .nis-mcp-env\Scripts\nis-mcp-bridge status
+   ```
+   You should see the stage position and the objectives on the turret.
+
+### Step 7. Use it from Claude
+
+Start a **new** Claude Code session in the project folder (a server added
+in Step 3 appears in new sessions only), and ask, for example, "What is the
+microscope's status?". A red STOP window and a monitor window open when the
+server starts.
+
+### When you are done: stop the bridge
+
 ```powershell
 .nis-mcp-env\Scripts\nis-mcp-bridge shutdown
 ```
-**Never press the JOBS Abort button**: a Python task cannot be interrupted
-and NIS freezes. The job also ends by itself after 4 hours with no request.
 
-After upgrading this package, paste the job file into NIS again.
+**Never press the JOBS Abort button**: a Python task cannot be interrupted
+and NIS freezes. The bridge also stops by itself after 4 hours with no
+request.
 
 ## Tools
 
@@ -178,6 +212,21 @@ def test_my_script_moves(bridge):
 ```
 
 To run this package's own tests: `pip install -e ".[test]"`, then `pytest`.
+
+## Known limits
+
+1. **An ND run blocks the bridge until it ends.** `nis_run_experiment`
+   returns only when the run is over, and nothing else (not even
+   `nis_status` or `nis_finish_experiment`) is answered meanwhile. Ending a
+   run early from MCP is therefore not possible yet; use NIS's own **Finish**
+   button in the ND Progress window.
+2. **The optical configuration cannot be selected** through the bridge:
+   choose it in NIS before `nis_capture`.
+3. **NIS does not report whether a saved ND experiment was found** (see
+   Tools); set `NIS_ALLOWED_EXPERIMENTS`.
+4. **The STOP and monitor windows close when the MCP client disconnects.**
+   The e-stop itself (the flag file) keeps working; open the STOP window by
+   hand with `.nis-mcp-env\Scripts\pythonw -m nis_elements_mcp.estop_panel`.
 
 ## License
 
