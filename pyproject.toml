@@ -1,0 +1,25 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "nis-elements-mcp"
+version = "0.1.0"
+description = "MCP server that drives a Nikon NIS-Elements microscope through a bridge job running inside NIS"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "mcp>=2.0,<3",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=8"]
+
+[project.scripts]
+nis-mcp = "nis_elements_mcp.nis_server:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/nis_elements_mcp"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
