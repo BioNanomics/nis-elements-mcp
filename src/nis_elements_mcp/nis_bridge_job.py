@@ -336,9 +336,12 @@ class Bridge:
                 return {"error": "e-stop engaged - ND run refused", "estop_engaged": True}
             if self.m.ND_IsInExperimentCapture():
                 return {"error": "an ND experiment is already running"}
+            # ND_LoadExperiment and ND_RunExperiment have no documented return
+            # value (NIS macro reference), and on the scope ND_LoadExperiment
+            # returned 0 for a template that does load (2026-10-30). So the
+            # codes are reported, not checked: NIS runs whatever the ND
+            # Acquisition window holds after the load.
             rc_load = self.m.ND_LoadExperiment(experiment)
-            if rc_load != 1:
-                return {"error": f"ND_LoadExperiment({experiment!r}) returned {rc_load}", "rc_load": rc_load}
             t0 = time.time()
             rc_run = self.m.ND_RunExperiment(0)          # 0: save to disk, do not open
             return {"rc_load": rc_load, "rc_run": rc_run,

@@ -40,7 +40,7 @@ class FakeNIS:
         self.position = 1
         self.label = self.objectives[1]     # NIS's objective name: only ChangeObjective moves it
         self.nd_running = False
-        self.load_rc = 1
+        self.load_rc = 0                    # what the real ND_LoadExperiment returned (it has no documented value)
         self.calls = []
         self.threads = {}               # call name -> id of the thread that made it
         self.last_saved = None

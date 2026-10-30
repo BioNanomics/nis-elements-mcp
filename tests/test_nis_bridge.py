@@ -115,12 +115,11 @@ def test_capture_saves_nd2_and_never_overwrites(bridge, tmp_path):
     assert "nd2" in c.capture(str(tmp_path / "x.tif"))["error"]
 
 
-def test_nd_run_refuses_second_run_and_reports_load_failure(bridge):
+def test_nd_run_reports_the_load_code_and_refuses_a_second_run(bridge):
     nis, url, c = bridge
-    nis.load_rc = -2
-    assert "ND_LoadExperiment" in c.nd_run("missing")["error"]
-    nis.load_rc = 1
-    assert c.nd_run("C. elegans 3h")["nd_running"] is True
+    r = c.nd_run("C. elegans 3h")                    # load returns 0, as on the scope: not a failure
+    assert r["rc_load"] == 0 and r["nd_running"] is True
+    assert nis.calls.index("ND_LoadExperiment") < nis.calls.index("ND_RunExperiment")
     assert "already running" in c.nd_run("C. elegans 3h")["error"]
 
 
@@ -193,9 +192,9 @@ def test_tools_raise_on_bridge_refusals_and_failures(bridge, tmp_path, monkeypat
     nis_tools.nis_capture("once", confirm=True)
     with pytest.raises(RuntimeError, match="already exists"):           # never overwrites
         nis_tools.nis_capture("once", confirm=True)
-    nis.load_rc = -2
-    with pytest.raises(RuntimeError, match="ND_LoadExperiment"):
-        nis_tools.nis_run_experiment("missing", confirm=True)
+    nis.nd_running = True
+    with pytest.raises(RuntimeError, match="already running"):          # a refusal raises
+        nis_tools.nis_run_experiment("second", confirm=True)
 
 
 def test_tool_raises_when_the_turret_does_not_arrive(bridge, monkeypatch):

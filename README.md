@@ -97,6 +97,11 @@ After upgrading this package, paste the job file into NIS again.
 | `nis_finish_experiment()` | end the running ND experiment after its current loop | no |
 | `estop(action)` | `engage` or `status`; release is not possible from the MCP client | no |
 
+NIS does not report whether `nis_run_experiment` found the saved name
+(`ND_LoadExperiment` has no return value): if the name is wrong, NIS runs
+whatever the ND Acquisition window currently holds. Check the name, and set
+`NIS_ALLOWED_EXPERIMENTS` to the names you mean to run.
+
 The bridge cannot select an optical configuration (doing so froze NIS):
 choose it in NIS before `nis_capture`. Activating an optical configuration in
 NIS may also turn the turret to that configuration's objective.

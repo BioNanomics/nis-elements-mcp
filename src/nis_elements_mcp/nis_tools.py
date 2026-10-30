@@ -119,10 +119,13 @@ def nis_capture(filename: str, confirm: bool = False) -> dict:
 def nis_run_experiment(experiment: str, confirm: bool = False) -> dict:
     """Start an ND experiment that was set up and SAVED in NIS-Elements'
     ND Acquisition window, by its saved name. It runs with exactly the
-    saved settings (time loop, channels, save-to-file path). The call may
-    not return until the experiment ends. Refused if one is already
-    running, or if NIS_ALLOWED_EXPERIMENTS is set and does not list it.
-    Requires confirm=True."""
+    saved settings (time loop, Z, channels, save-to-file path). NIS does
+    not report whether the name was found: if it was not, NIS runs
+    whatever the ND Acquisition window currently holds - so check that
+    window, or the name, with the operator first. The call may not return
+    until the experiment ends. Refused if one is already running, or if
+    NIS_ALLOWED_EXPERIMENTS is set and does not list it. Requires
+    confirm=True."""
     _require_confirm(confirm, "nis_run_experiment")
     return _checked(_bridge().nd_run(experiment))
 
