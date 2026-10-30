@@ -231,3 +231,8 @@ To run this package's own tests: `pip install -e ".[test]"`, then `pytest`.
 ## License
 
 MIT, see [LICENSE](LICENSE).
+
+This project is not affiliated with, endorsed by, or supported by Nikon.
+It contains no Nikon code: the bridge calls NIS-Elements' own macro
+functions on a PC where NIS-Elements is already installed and licensed.
+Nikon and NIS-Elements are trademarks of Nikon Corporation.
