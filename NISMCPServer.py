@@ -17,13 +17,16 @@ except ImportError:          # off the microscope (tests, python NISMCPServer.py
 # working distances cannot reach the dish), and nothing moves while the
 # e-stop file exists (~/.nis-mcp/ESTOP, the same file as nis-elements-mcp).
 #
-# Upgrade: edit this file and run the MCPServer job again. run() first asks
-# a server already on the port to stop, then starts the new code.
+# Upgrade: save this file. A watcher reloads it within seconds; if the new
+# code does not load, the old server keeps running. Running the MCPServer
+# job again also works: run() first asks a server on the port to stop.
+# A reload runs run() on the watcher thread, not NIS's main thread.
 # Stop:    POST http://127.0.0.1:8767/shutdown. Never press JOBS Abort.
 # Off NIS: python NISMCPServer.py   (serves in the foreground)
 # ------------------------------------------------------------
 import ctypes as ct
 import http.server
+import importlib.util
 import json
 import os
 import re
@@ -34,7 +37,8 @@ from pathlib import Path
 
 HOST = "127.0.0.1"
 PORT = int(os.environ.get("NIS_MCP_PORT", "").strip() or 8767)
-NAME, VERSION = "nis-mcp-server", "0.2.0"
+NAME, VERSION = "nis-mcp-server", "0.3.0"
+WATCH_S = 1.0                   # how often to look for a changed file
 PROTOCOL_VERSIONS = ("2025-11-25", "2025-06-18", "2025-03-26")   # newest first
 
 ALLOWED_MAGNIFICATIONS = (4.0, 10.0)
@@ -258,6 +262,7 @@ def start(port: int = PORT) -> http.server.ThreadingHTTPServer:
     server cannot bind the same port on Windows."""
     http.server.ThreadingHTTPServer.allow_reuse_address = False
     srv = http.server.ThreadingHTTPServer((HOST, port), Handler)
+    srv.done = threading.Event()
     threading.Thread(target=srv.serve_forever, name="nis-mcp-server", daemon=True).start()
     return srv
 
@@ -266,6 +271,41 @@ def stop(srv: http.server.ThreadingHTTPServer) -> None:
     """Stop serving and free the port."""
     srv.shutdown()
     srv.server_close()
+    srv.done.set()
+
+
+def watch(srv: http.server.ThreadingHTTPServer, run_args: tuple) -> None:
+    """While srv serves, reload this file when it changes. The new code's
+    run() replaces this server. If the new code does not load, keep serving."""
+    path = Path(__file__)
+
+    def stamp():
+        try:
+            st = path.stat()
+            return st.st_mtime_ns, st.st_size
+        except OSError:
+            return None
+
+    seen = stamp()
+    while not srv.done.wait(WATCH_S):
+        now = stamp()
+        if now is None or now == seen:
+            continue
+        time.sleep(0.5)                 # let the editor finish writing
+        if stamp() != now:
+            continue                    # still changing: look again
+        seen = now
+        try:
+            spec = importlib.util.spec_from_file_location("NISMCPServer", path)
+            new = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(new)
+        except Exception as e:
+            print(f"NIS MCP server: {path.name} changed but does not load "
+                  f"({type(e).__name__}: {e}) - still serving {VERSION}")
+            continue
+        print(f"NIS MCP server: {path.name} changed - reloading")
+        new.run(*run_args)
+        return
 
 
 def stop_running(port: int = PORT) -> bool:
@@ -293,7 +333,9 @@ def run(imgs: "tuple[limjob.Image]", Job: "limjob.JobParam", macro: "limjob.Macr
     else:
         print(f"NIS MCP server: port {PORT} is busy")
         return
-    print(f"NIS MCP server {VERSION} on http://{HOST}:{srv.server_address[1]}/mcp")
+    threading.Thread(target=watch, args=(srv, (imgs, Job, macro, ctx)), name="nis-mcp-watch",
+                     daemon=True).start()
+    print(f"NIS MCP server {VERSION} on http://{HOST}:{srv.server_address[1]}/mcp, reloads on save")
 
 
 if __name__ == "__main__":

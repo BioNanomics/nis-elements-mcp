@@ -35,8 +35,11 @@ Nikon and NIS-Elements are trademarks of Nikon Corporation.
 
 ## Upgrade
 
-Edit `NISMCPServer.py` and run the `MCPServer` job again: it stops the old
-server and starts the new code. No copy-paste into NIS.
+Edit and save `NISMCPServer.py`. The running server notices within a
+couple of seconds and replaces itself with the new code; if the new code
+does not load (a syntax error, say), the old server keeps running and the
+error is printed in the JOBS log. Running the `MCPServer` job again also
+restarts it. No copy-paste into NIS.
 
 ## Stop
 

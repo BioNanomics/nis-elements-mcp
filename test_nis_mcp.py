@@ -78,6 +78,48 @@ def test_rerun_replaces_the_running_server():
     assert not server.stop_running(port)
 
 
+def test_reloads_on_save_and_keeps_serving_broken_code(tmp_path, monkeypatch):
+    import importlib.util
+    import socket
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]
+    monkeypatch.setenv("NIS_MCP_PORT", str(port))
+    path = tmp_path / "NISMCPServer.py"
+    source = open(server.__file__, encoding="utf-8").read().replace("WATCH_S = 1.0", "WATCH_S = 0.1")
+    path.write_text(source, encoding="utf-8")
+    spec = importlib.util.spec_from_file_location("NISMCPServer", path)
+    first = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(first)                      # what the job's loader does
+    first.run(None, None, None, None)
+
+    def version():
+        return post(f"http://127.0.0.1:{port}/mcp", {"jsonrpc": "2.0", "id": 1, "method": "initialize",
+                                                     "params": {}})[1]["result"]["serverInfo"]["version"]
+
+    def wait_for(v):
+        for _ in range(60):
+            try:
+                if version() == v:
+                    return True
+            except OSError:
+                pass                                    # between the old server and the new
+            time.sleep(0.1)
+        return False
+
+    try:
+        assert version() == server.VERSION
+        path.write_text(source.replace(f'"{server.VERSION}"', '"9.9.9"'), encoding="utf-8")
+        assert wait_for("9.9.9")
+        path.write_text(source + "\nthis is not python\n", encoding="utf-8")
+        time.sleep(1.5)
+        assert version() == "9.9.9"                     # broken code: the old server keeps serving
+        path.write_text(source.replace(f'"{server.VERSION}"', '"9.9.10"'), encoding="utf-8")
+        assert wait_for("9.9.10")                       # and the watcher still works after it
+    finally:
+        server.stop_running(port)
+
+
 def test_real_mcp_client(url):
     anyio = pytest.importorskip("anyio")
     pytest.importorskip("mcp")
