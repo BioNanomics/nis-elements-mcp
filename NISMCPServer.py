@@ -66,6 +66,7 @@ MAX_STEP_UM = 1000.0            # largest XY step per call, per axis
 CAPTURE_DIR = Path.home() / "nis-mcp" / "captures"
 LOG_FILE = Path.home() / "nis-mcp" / "log.jsonl"   # one JSON line per tool call
 ALLOWED_EXPERIMENTS = ()        # saved ND experiment names; empty: any
+MAX_ND_RUN_S = 30 * 60.0        # longest time-lapse run_experiment starts (an ND run holds NIS)
 # where NIS keeps the saved ND experiments (the "AX Confocal" profile)
 ND_STORED = (Path(os.environ.get("PROGRAMDATA") or r"C:\ProgramData")
              / "Laboratory Imaging" / "Platform" / "AX Confocal" / "ND_Stored.bin")
@@ -441,7 +442,7 @@ def _summary(name: str, acq: dict) -> dict:
     """What a saved experiment does, from the settings it is known to keep."""
     tabs, top = acq.get("Tabs", {}), acq.get("NDAcquisitionTop", {})
     loops = [label for tab, label in _ND_LOOPS.items() if tabs.get(f"b{tab}Checked")]
-    out = {"name": name, "loops": loops}
+    out = {"name": name, "loops": loops, "run_length_s": run_length_s(acq)}
     if "time" in loops:
         phases = acq.get("NDAcquisitionTimelapse", {}).get("aData", {}).values()
         out["time"] = [{"interval_s": p.get("dInterval", 0) / 1000, "duration_s": p.get("dDuration", 0) / 1000,
@@ -452,6 +453,23 @@ def _summary(name: str, acq: dict) -> dict:
     if top.get("sFileName"):
         out["saves_to"] = str(Path(top.get("sPath", "")) / top["sFileName"])
     return out
+
+
+def run_length_s(acq: dict) -> "float | None":
+    """How long a saved experiment's time-lapse lasts, in s: 0 without one, None if unclear."""
+    if not acq.get("Tabs", {}).get("bTimeChecked"):
+        return 0.0                              # a single pass through the other loops
+    total = 0.0
+    for p in acq.get("NDAcquisitionTimelapse", {}).get("aData", {}).values():
+        if not isinstance(p, dict):
+            continue
+        duration = p.get("dDuration", 0) / 1000
+        frames, interval = p.get("uiCount", 0), p.get("dInterval", 0) / 1000
+        length = duration if duration > 0 else interval * (frames - 1) if frames > 1 else 0
+        if length <= 0:
+            return None                         # a phase with neither: cannot tell
+        total += length
+    return total or None
 
 
 def list_experiments(args: dict) -> dict:
@@ -473,14 +491,21 @@ def run_experiment(args: dict) -> dict:
     # NIS runs whatever its ND window holds when the name is not found, so an
     # unknown name - or a list that cannot be read - is refused here.
     try:
-        saved = list(saved_experiments())
+        saved = saved_experiments()
     except (OSError, ValueError) as e:
         return {"error": f"cannot check the name: the saved ND experiments in {ND_STORED} "
                          f"did not read ({e})"}
     if name not in saved:
         return {"error": f"no saved ND experiment is named {name!r}. NIS may write {ND_STORED.name} "
                          "only when it saves settings, so an experiment saved just now may not be "
-                         "listed yet", "saved": saved}
+                         "listed yet", "saved": list(saved)}
+    length = run_length_s(saved[name])
+    if length is None or length > MAX_ND_RUN_S:
+        why = "its time-lapse length cannot be worked out" if length is None else \
+              f"its time-lapse runs {length / 60:g} min"
+        return {"error": f"ND experiment {name!r} refused: {why}, and runs from here are limited to "
+                         f"{MAX_ND_RUN_S / 60:g} min (MAX_ND_RUN_S). Start it in NIS, or raise the limit.",
+                "run_length_s": length}
     if (r := _stopped("ND run")):
         return r
     with nis().held() as m:

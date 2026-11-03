@@ -440,6 +440,26 @@ def test_run_experiment_refuses_a_name_that_is_not_saved(scope, main_thread):
     assert scope.calls == []
 
 
+def test_run_experiment_refuses_a_long_or_unclear_time_lapse(scope, main_thread):
+    write_nd_stored(server.ND_STORED, {
+        "90 s": experiment(time=[(20_000.0, 90_000.0, 5)]),
+        "by frames": experiment(time=[(60_000.0, 0.0, 21)]),            # 20 min from interval x frames
+        "two phases": experiment(time=[(60_000.0, 1_200_000.0, 0), (60_000.0, 1_200_000.0, 0)]),
+        "overnight": experiment(time=[(60_000.0, 27_000_000.0, 451)]),
+        "unclear": experiment(time=[(0.0, 0.0, 0)]),
+        "stack": experiment(z=(41, 0.75))})
+    out, err = tool("run_experiment", experiment="two phases")
+    assert err and "40 min" in out["error"] and out["run_length_s"] == 2400
+    out, err = tool("run_experiment", experiment="overnight")
+    assert err and "450 min" in out["error"] and "MAX_ND_RUN_S" in out["error"]
+    assert "cannot be worked out" in tool("run_experiment", experiment="unclear")[0]["error"]
+    assert scope.calls == []
+    for ok in ("90 s", "by frames", "stack"):
+        out, err = tool("run_experiment", experiment=ok)
+        assert not err, ok
+        scope.nd_running = False
+
+
 def test_list_experiments(scope):
     write_nd_stored(server.ND_STORED, {
         "Pilot 60s": experiment(time=[(60_000.0, 3_600_000.0, 61)], z=(1, 0.75), file=("D:\\data", "p.nd2")),
@@ -448,11 +468,12 @@ def test_list_experiments(scope):
     out, err = tool("list_experiments")
     assert not err and out["file"] == str(server.ND_STORED) and out["file_written"]
     assert out["experiments"] == [
-        {"name": "Pilot 60s", "loops": ["time", "z_stack"], "z_stack": {"steps": 1, "step_um": 0.75},
+        {"name": "Pilot 60s", "loops": ["time", "z_stack"], "run_length_s": 3600.0,
+         "z_stack": {"steps": 1, "step_um": 0.75},
          "time": [{"interval_s": 60.0, "duration_s": 3600.0, "frames": 61}],
          "saves_to": str(server.Path("D:\\data") / "p.nd2")},
-        {"name": "Stack", "loops": ["z_stack"], "z_stack": {"steps": 41, "step_um": 0.75}},
-        {"name": "Grid", "loops": ["xy_points"]}]
+        {"name": "Stack", "loops": ["z_stack"], "run_length_s": 0.0, "z_stack": {"steps": 41, "step_um": 0.75}},
+        {"name": "Grid", "loops": ["xy_points"], "run_length_s": 0.0}]
     assert scope.calls == []
 
 
