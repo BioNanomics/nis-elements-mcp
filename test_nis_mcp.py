@@ -276,6 +276,18 @@ def test_change_objective_turns_then_calibrates(scope):
     assert tool("change_objective", name="Plan Apo 10x")[0] == {"objective": "Plan Apo 10x", "changed": False}
 
 
+def test_change_objective_by_magnification(scope):
+    out, err = tool("change_objective", name="10x")
+    assert not err and out["objective"] == "Plan Apo 10x"
+    assert scope.calls == [("turn", 2), ("calibrate", "Plan Apo 10x")]   # NIS gets the full name
+
+
+def test_change_objective_by_magnification_refuses_ambiguity(scope):
+    scope.names = {0: "Plan Apo 10x", 1: "Plan Fluor 4x", 2: "Plan Apo 10x DIC"}
+    out, err = tool("change_objective", name="10x")
+    assert err and "more than one" in out["error"] and scope.calls == []
+
+
 def test_change_objective_refusals(scope):
     out, err = tool("change_objective", name="Plan Apo 20x")
     assert err and "only 4x/10x" in out["error"]

@@ -285,10 +285,16 @@ def change_objective(args: dict) -> dict:
     with nis().held() as m:
         pos, before, names = m.turret()
         targets = [i for i, n in names.items() if n == name]
+        if not targets and _MAG.fullmatch(name.strip()):
+            # A bare magnification ("10x"): the one objective with it. A full
+            # name must match exactly, so a mistyped one is not guessed at.
+            targets = [i for i, n in names.items() if magnification(n) == magnification(name)]
         if len(targets) != 1:
-            return {"error": f"{name!r} is not on the nosepiece exactly once",
+            what = "matches more than one objective" if targets else "is not on the nosepiece"
+            return {"error": f"{name!r} {what}: give the objective's name as listed",
                     "current": before, "nosepiece": names}
         target = targets[0]
+        name = names[target]
         if pos == target and before == name:
             return {"objective": name, "changed": False}
         # Both calls are needed (seen on the scope 2026-10-13/14):
@@ -300,6 +306,8 @@ def change_objective(args: dict) -> dict:
         while rc == 1 and pos != target and time.time() < deadline:
             time.sleep(TURRET_POLL_S)
             pos = m.Stg_GetNosepiecePosition()
+        # ChangeObjective returned 0 on the scope (2026-11-03) when it did switch:
+        # rc_calibration 0 is not a failure. Arrival is judged from the turret below.
         rc_calibration = m.ChangeObjective(name) if pos == target else None
         pos, after, _ = m.turret()
     out = {"objective": after, "before": before, "changed": after != before,
@@ -433,7 +441,8 @@ TOOLS = [
     ({"name": "change_objective",
       "description": "Turn the nosepiece to an objective and switch NIS's calibration to it. Only the 4x "
                      "and 10x objectives are allowed. Give the objective's name exactly as on the "
-                     "nosepiece; a wrong name returns the list.",
+                     "nosepiece, or just its magnification ('10x') when one objective has it; "
+                     "a wrong or ambiguous name returns the list.",
       "inputSchema": _schema(name=_STRING)},
      change_objective),
     ({"name": "list_optical_configs",
