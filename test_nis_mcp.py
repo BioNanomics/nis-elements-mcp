@@ -245,6 +245,7 @@ def scope(monkeypatch, tmp_path):
     monkeypatch.setattr(server, "_nis", server.NIS(fake))
     monkeypatch.setattr(server, "ESTOP", tmp_path / "ESTOP")
     monkeypatch.setattr(server, "ND_STORED", tmp_path / "ND_Stored.bin")
+    monkeypatch.setattr(server, "LOG_FILE", tmp_path / "log.jsonl")
     write_nd_stored(server.ND_STORED, {n: experiment() for n in ("C. elegans 3h", "long", "e")})
     monkeypatch.setattr(server, "CAPTURE_DIR", tmp_path / "captures")
     monkeypatch.setattr(server, "_ui", server.MainThread())     # not installed, as off NIS
@@ -368,6 +369,24 @@ def test_move_relative_and_its_refusals(scope):
     out, err = tool("move_relative", dx_um=1, dy_um=0)
     assert err and out["estop_engaged"]
     assert scope.calls == [("move", 50.0, -20.0)]
+
+
+def test_every_call_is_logged(scope):
+    tool("move_relative", dx_um=50, dy_um=0)
+    server.ESTOP.write_text("")
+    tool("capture", filename="x")
+    lines = [json.loads(s) for s in server.LOG_FILE.read_text(encoding="utf-8").splitlines()]
+    assert [(e["tool"], e["ok"]) for e in lines] == [("move_relative", True), ("capture", False)]
+    assert lines[0]["args"] == {"dx_um": 50, "dy_um": 0} and lines[0]["result"]["after_um"] == [150.0, 200.0]
+    assert "e-stop" in lines[1]["result"]["error"] and lines[1]["time"]
+
+
+def test_a_log_that_cannot_be_written_does_not_stop_a_tool(scope, monkeypatch):
+    monkeypatch.setattr(server, "LOG_FILE", server.ND_STORED)       # an existing file...
+    server.LOG_FILE.unlink()
+    server.LOG_FILE.mkdir()                                          # ...replaced by a folder
+    out, err = tool("move_relative", dx_um=5, dy_um=0)
+    assert not err and out["after_um"] == [105.0, 200.0]
 
 
 def test_list_optical_configs(scope):

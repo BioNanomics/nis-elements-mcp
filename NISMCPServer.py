@@ -64,6 +64,7 @@ PROTOCOL_VERSIONS = ("2025-11-25", "2025-06-18", "2025-03-26")   # newest first
 ALLOWED_MAGNIFICATIONS = (4.0, 10.0)
 MAX_STEP_UM = 1000.0            # largest XY step per call, per axis
 CAPTURE_DIR = Path.home() / "nis-mcp" / "captures"
+LOG_FILE = Path.home() / "nis-mcp" / "log.jsonl"   # one JSON line per tool call
 ALLOWED_EXPERIMENTS = ()        # saved ND experiment names; empty: any
 # where NIS keeps the saved ND experiments (the "AX Confocal" profile)
 ND_STORED = (Path(os.environ.get("PROGRAMDATA") or r"C:\ProgramData")
@@ -616,12 +617,31 @@ TOOLS = [
 ]
 
 
+_log_lock = threading.Lock()
+
+
+def _log(tool: str, args: dict, out: dict, took_s: float) -> None:
+    """Append one line per tool call to LOG_FILE. Never fails the call."""
+    entry = {"time": datetime.datetime.now().isoformat(timespec="seconds"), "tool": tool, "args": args,
+             "ok": "error" not in out, "took_s": round(took_s, 1), "result": out}
+    try:
+        line = json.dumps(entry, ensure_ascii=False, default=str)
+        with _log_lock:
+            LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+            with open(LOG_FILE, "a", encoding="utf-8") as f:
+                f.write(line + "\n")
+    except Exception as e:                      # a full disk or locked file must not stop the scope
+        print(f"NIS MCP server: could not write {LOG_FILE}: {e}")
+
+
 def call_tool(name: str, args: dict) -> dict:
     fn = dict((t["name"], f) for t, f in TOOLS)[name]       # KeyError: unknown tool
+    t0 = time.time()
     try:
         out = fn(args)
     except Exception as e:
         out = {"error": f"{type(e).__name__}: {e}"}
+    _log(name, args, out, time.time() - t0)
     text = out["text"] if fn is echo and "error" not in out else json.dumps(out, indent=1)
     return {"content": [{"type": "text", "text": text}], "isError": "error" in out}
 
