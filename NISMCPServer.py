@@ -244,7 +244,9 @@ def estop_engaged() -> bool:
 
 def _stopped(what: str) -> "dict | None":
     if estop_engaged():
-        return {"error": f"e-stop engaged ({ESTOP}) - {what} refused", "estop_engaged": True}
+        return {"error": f"e-stop engaged ({ESTOP}) - {what} refused. Only a person releases it; "
+                         "when they say so, call again - do not assume it is still engaged",
+                "estop_engaged": True}
     return None
 
 
@@ -528,6 +530,17 @@ def estop(args: dict) -> dict:
     return out
 
 
+# Sent to the client at initialize: how an agent should use these tools.
+INSTRUCTIONS = (
+    "These tools drive a real microscope (NIS-Elements) that a person may be using at the same time. "
+    "The state changes outside this conversation: a person can move the stage, change the objective, "
+    "or engage or release the e-stop at any moment. Never answer from what an earlier call returned: "
+    "call status (or estop with action \"status\") for the current state, and simply call a tool to "
+    "find out whether it is allowed - the server refuses whatever is unsafe and says why. Before an ND "
+    "run, call list_experiments and tell the operator how long the run takes. Engage the e-stop the "
+    "moment anything looks wrong; releasing it is for a person only.")
+
+
 def _schema(**props) -> dict:
     """{"type": "object"} with these properties, all required."""
     return {"type": "object", "properties": props, "required": list(props)}
@@ -593,7 +606,8 @@ TOOLS = [
                      "position that does not match, the operator says stop): action \"engage\" forbids "
                      "every move, objective change, capture and ND run until a person releases it. A "
                      "move already under way finishes. action \"status\" reports. It cannot be released "
-                     "from here.",
+                     "from here, but a person can release it at any time: never assume it is still "
+                     "engaged from an earlier answer - check with action \"status\", or just call the tool.",
       "inputSchema": {"type": "object",
                       "properties": {"action": {"type": "string", "enum": ["engage", "status"]},
                                      "reason": _STRING},
@@ -624,7 +638,8 @@ def handle(msg: dict) -> "dict | None":
             asked = params.get("protocolVersion")
             result = {"protocolVersion": asked if asked in PROTOCOL_VERSIONS else PROTOCOL_VERSIONS[0],
                       "capabilities": {"tools": {"listChanged": False}},
-                      "serverInfo": {"name": NAME, "version": VERSION}}
+                      "serverInfo": {"name": NAME, "version": VERSION},
+                      "instructions": INSTRUCTIONS}
         elif method == "ping":
             result = {}
         elif method == "tools/list":

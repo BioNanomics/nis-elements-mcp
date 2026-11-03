@@ -38,6 +38,7 @@ def test_handshake_list_and_echo(url):
                                       "params": {"protocolVersion": "2025-06-18", "capabilities": {},
                                                  "clientInfo": {"name": "t", "version": "0"}}})
     assert status == 200 and out["result"]["protocolVersion"] == "2025-06-18"
+    assert "Never answer from what an earlier call returned" in out["result"]["instructions"]
     assert post(url + "/mcp", {"jsonrpc": "2.0", "method": "notifications/initialized"})[0] == 202
     tools = post(url + "/mcp", {"jsonrpc": "2.0", "id": 2, "method": "tools/list"})[1]["result"]["tools"]
     assert [t["name"] for t in tools] == ["echo", "status", "move_relative", "change_objective",
