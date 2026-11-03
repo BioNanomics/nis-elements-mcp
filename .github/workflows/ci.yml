@@ -1,0 +1,44 @@
+name: CI
+
+on:
+  push:            # every branch, so a push runs even before a pull request exists
+  pull_request:
+
+jobs:
+  # The server inside NIS: standard library only, plus the mcp SDK for the
+  # one test that talks to it as a real MCP client.
+  nis-mcp-server:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [windows-latest, ubuntu-latest]
+        python-version: ["3.11", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - run: pip install pytest "mcp>=2.0,<3"
+      - run: python -m pytest -v test_nis_mcp.py
+
+  # The bridge package: installed (not editable), on the OS it is used on
+  # (Windows) and on Linux. Its tests run against the installed copy.
+  bridge:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [windows-latest, ubuntu-latest]
+        python-version: ["3.11", "3.13"]
+    defaults:
+      run:
+        working-directory: bridge
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - run: pip install ".[test]"
+      - run: python -m pytest -v
+      # The installed commands exist and the bridge job file ships with the package.
+      - run: nis-mcp-bridge job-file
+      - run: nis-mcp-estop status

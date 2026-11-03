@@ -17,6 +17,7 @@ Nikon and NIS-Elements are trademarks of Nikon Corporation.
 | `NISMCPServer.py` | the server |
 | `install_job.py` | creates the `MCPServer` job in NIS's JOBS database; the job just loads `NISMCPServer.py` from this folder |
 | `test_nis_mcp.py` | tests (`pytest`; one test uses the `mcp` SDK if installed) |
+| `bridge/` | the earlier design, the `nis-elements-mcp` package: an MCP server outside NIS that talks to a bridge job inside NIS on port 8766. Full tool set (move, capture, objective, ND runs), tested on the scope. Same e-stop file. See [bridge/README.md](bridge/README.md) |
 
 ## Install
 

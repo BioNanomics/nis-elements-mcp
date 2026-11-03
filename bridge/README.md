@@ -51,11 +51,11 @@ python -m venv .nis-mcp-env
 ### Step 2. Install the package
 
 ```powershell
-.nis-mcp-env\Scripts\pip install "git+https://github.com/BioNanomics/microscope-agent#subdirectory=packages/nis-elements-mcp"
+.nis-mcp-env\Scripts\pip install "git+https://github.com/BioNanomics/nis-elements-mcp#subdirectory=bridge"
 ```
 
 > From a local copy instead of GitHub:
-> `.nis-mcp-env\Scripts\pip install D:\path\to\microscope-agent\packages\nis-elements-mcp`
+> `.nis-mcp-env\Scripts\pip install D:\path\to\nis-elements-mcp\bridge`
 
 ### Step 3. Register the server with Claude Code
 
@@ -72,7 +72,7 @@ claude mcp add nis --scope local -- "$PWD\.nis-mcp-env\Scripts\nis-mcp.exe"
 >   ```
 > - With [uv](https://docs.astral.sh/uv/), one line replaces Steps 1 to 3:
 >   ```powershell
->   claude mcp add nis --scope local -- uvx --from "git+https://github.com/BioNanomics/microscope-agent#subdirectory=packages/nis-elements-mcp" nis-mcp
+>   claude mcp add nis --scope local -- uvx --from "git+https://github.com/BioNanomics/nis-elements-mcp#subdirectory=bridge" nis-mcp
 >   ```
 
 ### Step 4. Start the microscope and NIS
