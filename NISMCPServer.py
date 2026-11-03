@@ -567,8 +567,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
 def start(port: int = PORT) -> http.server.ThreadingHTTPServer:
     """Bind and serve on a daemon thread. Without SO_REUSEADDR a second
-    server cannot bind the same port on Windows."""
-    http.server.ThreadingHTTPServer.allow_reuse_address = False
+    server cannot bind the same port on Windows. Elsewhere it never allows
+    that, and without it a restart cannot bind the port for a minute."""
+    http.server.ThreadingHTTPServer.allow_reuse_address = os.name != "nt"
     srv = http.server.ThreadingHTTPServer((HOST, port), Handler)
     srv.done = threading.Event()
     threading.Thread(target=srv.serve_forever, name="nis-mcp-server", daemon=True).start()
