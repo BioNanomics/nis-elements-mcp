@@ -94,9 +94,12 @@ Never press the JOBS **Abort** button: it freezes NIS.
 ## Known limits
 
 1. **An ND run holds NIS until it ends.** `run_experiment` answers only when
-   the run is over; meanwhile the other tools answer that NIS is busy, so
+   the run is over. Meanwhile `status` answers at once from the server's own
+   record (experiment, start, expected end, elapsed time, XY at the start)
+   and `estop` works, but the tools that need NIS answer that it is busy, so
    `finish_experiment` cannot end it early. Use NIS's **Finish** button in
-   the ND Progress window.
+   the ND Progress window. NIS also keeps each run's ND2 file open
+   afterwards, so it cannot be deleted until it is closed in NIS.
 2. **The saved ND experiments are read from NIS's own file**,
    `C:\ProgramData\Laboratory Imaging\Platform\AX Confocal\ND_Stored.bin`,
    because no macro function lists them. NIS itself does not say whether a

@@ -57,7 +57,7 @@ from pathlib import Path
 
 HOST = "127.0.0.1"
 PORT = int(os.environ.get("NIS_MCP_PORT", "").strip() or 8767)
-NAME, VERSION = "nis-mcp-server", "0.5.0"
+NAME, VERSION = "nis-mcp-server", "0.6.0"
 WATCH_S = 1.0                   # how often to look for a changed file
 PROTOCOL_VERSIONS = ("2025-11-25", "2025-06-18", "2025-03-26")   # newest first
 
@@ -263,7 +263,20 @@ def echo(args: dict) -> dict:
     return {"text": args["text"]}
 
 
+# The ND run run_experiment is waiting on, or None. NIS is held for the whole
+# run, so status answers from this instead of waiting for NIS.
+_nd_run: "dict | None" = None
+
+
 def status(args: dict) -> dict:
+    run = _nd_run
+    if run is not None:
+        elapsed = time.time() - datetime.datetime.fromisoformat(run["started"]).timestamp()
+        return {"nd_running": True, "nd_run": dict(run, elapsed_s=round(elapsed)),
+                "estop_engaged": estop_engaged(), "xy_limits_um": XY_LIMITS_UM,
+                "note": "NIS is held by this ND run until it ends, so the stage and objective are not "
+                        "read now and other tools answer busy. To stop it early use NIS's Finish button; "
+                        "the e-stop can still be engaged."}
     with nis().held() as m:
         x, y, z = m.position()
         pos, cur, names = m.turret()
@@ -522,6 +535,7 @@ def run_experiment(args: dict) -> dict:
                 "run_length_s": length}
     if (r := _stopped("ND run")):
         return r
+    global _nd_run
     with nis().held() as m:
         def on_main_thread() -> dict:
             if (r := _stopped("ND run")):
@@ -538,7 +552,15 @@ def run_experiment(args: dict) -> dict:
             return {"experiment": name, "rc_load": rc_load, "rc_run": rc_run,
                     "call_returned_after_s": round(time.time() - t0, 1),
                     "nd_running": bool(m.ND_IsInExperimentCapture())}
-        return _ui.call(on_main_thread, timeout_s=ND_RUN_TIMEOUT_S)
+        now = datetime.datetime.now()
+        _nd_run = {"experiment": name, "started": now.isoformat(timespec="seconds"),
+                   "expected_end": (now + datetime.timedelta(seconds=length)).isoformat(timespec="seconds")
+                   if length else None,
+                   "run_length_s": length, "xy_um_at_start": list(m.position()[:2])}
+        try:
+            return _ui.call(on_main_thread, timeout_s=ND_RUN_TIMEOUT_S)
+        finally:
+            _nd_run = None
 
 
 def finish_experiment(args: dict) -> dict:

@@ -16,6 +16,12 @@ import NISMCPServer as server
 
 
 # --- server ------------------------------------------------------------
+@pytest.fixture(autouse=True)
+def no_real_log(monkeypatch, tmp_path):
+    """Tests never write to the scope's own log."""
+    monkeypatch.setattr(server, "LOG_FILE", tmp_path / "log.jsonl")
+
+
 @pytest.fixture
 def url():
     srv = server.start(port=0)
@@ -517,11 +523,31 @@ def test_other_tools_answer_busy_while_an_nd_run_blocks(scope, main_thread, monk
     run.start()
     while "nd_run" not in scope.threads:
         time.sleep(0.01)
-    out, err = tool("status")
+    t0 = time.time()
+    out, err = tool("status")                       # answers from the server's record, at once
+    assert not err and time.time() - t0 < 0.1 and out["nd_running"] and "Finish button" in out["note"]
+    assert out["nd_run"]["experiment"] == "long" and out["nd_run"]["xy_um_at_start"] == [100.0, 200.0]
+    out, err = tool("move_relative", dx_um=1, dy_um=0)
     assert err and "NISBusy" in out["error"]
+    assert tool("estop", action="engage")[0]["engaged"]      # stopping still works mid-run
     scope.nd_blocks.set()
     run.join()
-    assert not tool("status")[1]
+    out, err = tool("status")
+    assert not err and "nd_run" not in out and out["xy_um"] == [100.0, 200.0]
+
+
+def test_status_reports_when_an_nd_run_should_end(scope, main_thread):
+    write_nd_stored(server.ND_STORED, {"90 s": experiment(time=[(20_000.0, 90_000.0, 5)])})
+    scope.nd_blocks = threading.Event()
+    run = threading.Thread(target=tool, args=("run_experiment",), kwargs={"experiment": "90 s"})
+    run.start()
+    while "nd_run" not in scope.threads:
+        time.sleep(0.01)
+    r = tool("status")[0]["nd_run"]
+    scope.nd_blocks.set()
+    run.join()
+    started, end = (server.datetime.datetime.fromisoformat(r[k]) for k in ("started", "expected_end"))
+    assert (end - started).total_seconds() == 90 and r["run_length_s"] == 90
 
 
 def test_estop_engages_and_cannot_release(scope):
