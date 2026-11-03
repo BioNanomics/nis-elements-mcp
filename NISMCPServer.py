@@ -63,6 +63,11 @@ PROTOCOL_VERSIONS = ("2025-11-25", "2025-06-18", "2025-03-26")   # newest first
 
 ALLOWED_MAGNIFICATIONS = (4.0, 10.0)
 MAX_STEP_UM = 1000.0            # largest XY step per call, per axis
+# The XY area moves may not leave, ((x_min, x_max), (y_min, y_max)) in um, as
+# status reports the stage. None refuses every move. TEMPORARY: +-2 mm around
+# where the stage was on 2026-11-03 with no sample; measure the real safe
+# area for the holder in use (move there in NIS, read status) and set it here.
+XY_LIMITS_UM = ((-4102.4, -102.4), (-3599.5, 400.5))
 CAPTURE_DIR = Path.home() / "nis-mcp" / "captures"
 LOG_FILE = Path.home() / "nis-mcp" / "log.jsonl"   # one JSON line per tool call
 ALLOWED_EXPERIMENTS = ()        # saved ND experiment names; empty: any
@@ -264,7 +269,8 @@ def status(args: dict) -> dict:
         pos, cur, names = m.turret()
         nd = bool(m.ND_IsInExperimentCapture())
     return {"xy_um": [x, y], "z_um": z, "objective": cur, "nosepiece_position": pos,
-            "nosepiece": names, "nd_running": nd, "estop_engaged": estop_engaged()}
+            "nosepiece": names, "nd_running": nd, "estop_engaged": estop_engaged(),
+            "xy_limits_um": XY_LIMITS_UM}
 
 
 def move_relative(args: dict) -> dict:
@@ -276,8 +282,16 @@ def move_relative(args: dict) -> dict:
         return r
     if not (abs(dx) <= MAX_STEP_UM and abs(dy) <= MAX_STEP_UM):     # also refuses nan
         return {"error": f"steps over {MAX_STEP_UM:g} um per axis are refused, got ({dx:g}, {dy:g})"}
+    if XY_LIMITS_UM is None:
+        return {"error": "no safe XY area is set (XY_LIMITS_UM in NISMCPServer.py): moves are refused"}
     with nis().held() as m:
         before = m.position()[:2]
+        target = (before[0] + dx, before[1] + dy)
+        (x0, x1), (y0, y1) = XY_LIMITS_UM
+        if not (x0 <= target[0] <= x1 and y0 <= target[1] <= y1):
+            return {"error": f"the move would end at ({target[0]:g}, {target[1]:g}) um, outside the safe "
+                             f"XY area x {x0:g}..{x1:g}, y {y0:g}..{y1:g} (XY_LIMITS_UM)",
+                    "position_um": list(before), "xy_limits_um": XY_LIMITS_UM}
         rc = m.StgMoveXY(dx, dy, MOVE_RELATIVE)
         after = m.position()[:2]
     return {"before_um": list(before), "after_um": list(after), "rc": rc}
@@ -586,8 +600,9 @@ TOOLS = [
      status),
     ({"name": "move_relative",
       "description": f"Move the XY stage by (dx_um, dy_um) microns from where it is, at most "
-                     f"{MAX_STEP_UM:g} um per axis. Returns the position before and after; treat "
-                     "after_um as the truth. Z cannot be moved.",
+                     f"{MAX_STEP_UM:g} um per axis, and never out of the safe XY area (status reports "
+                     "it as xy_limits_um). Returns the position before and after; treat after_um as "
+                     "the truth. Z cannot be moved.",
       "inputSchema": _schema(dx_um=_NUMBER, dy_um=_NUMBER)},
      move_relative),
     ({"name": "change_objective",

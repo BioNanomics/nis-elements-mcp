@@ -246,6 +246,7 @@ def scope(monkeypatch, tmp_path):
     monkeypatch.setattr(server, "ESTOP", tmp_path / "ESTOP")
     monkeypatch.setattr(server, "ND_STORED", tmp_path / "ND_Stored.bin")
     monkeypatch.setattr(server, "LOG_FILE", tmp_path / "log.jsonl")
+    monkeypatch.setattr(server, "XY_LIMITS_UM", ((-2000.0, 2000.0), (-2000.0, 2000.0)))
     write_nd_stored(server.ND_STORED, {n: experiment() for n in ("C. elegans 3h", "long", "e")})
     monkeypatch.setattr(server, "CAPTURE_DIR", tmp_path / "captures")
     monkeypatch.setattr(server, "_ui", server.MainThread())     # not installed, as off NIS
@@ -357,7 +358,8 @@ def test_status(scope):
     out, err = tool("status")
     assert not err and out == {"xy_um": [100.0, 200.0], "z_um": 4619.0, "objective": "Plan Fluor 4x",
                                "nosepiece_position": 1, "nd_running": False, "estop_engaged": False,
-                               "nosepiece": {"0": "Plan Apo 20x", "1": "Plan Fluor 4x", "2": "Plan Apo 10x"}}
+                               "nosepiece": {"0": "Plan Apo 20x", "1": "Plan Fluor 4x", "2": "Plan Apo 10x"},
+                               "xy_limits_um": [[-2000.0, 2000.0], [-2000.0, 2000.0]]}
 
 
 def test_move_relative_and_its_refusals(scope):
@@ -369,6 +371,18 @@ def test_move_relative_and_its_refusals(scope):
     out, err = tool("move_relative", dx_um=1, dy_um=0)
     assert err and out["estop_engaged"]
     assert scope.calls == [("move", 50.0, -20.0)]
+
+
+def test_move_relative_stays_in_the_safe_area(scope, monkeypatch):
+    for _ in range(2):                                   # 100 -> 1100 -> 2100: the second step leaves
+        out, err = tool("move_relative", dx_um=1000, dy_um=0)
+    assert err and "outside the safe XY area" in out["error"] and out["position_um"] == [1100.0, 200.0]
+    assert not tool("move_relative", dx_um=900, dy_um=-1000)[1]          # to the corner (2000, -800)
+    assert tool("move_relative", dx_um=0, dy_um=-1500)[1]                # y -2300: out
+    assert scope.calls == [("move", 1000.0, 0.0), ("move", 900.0, -1000.0)]
+    monkeypatch.setattr(server, "XY_LIMITS_UM", None)
+    out, err = tool("move_relative", dx_um=1, dy_um=0)
+    assert err and "no safe XY area" in out["error"] and len(scope.calls) == 2
 
 
 def test_every_call_is_logged(scope):
