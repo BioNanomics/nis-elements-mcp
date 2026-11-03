@@ -14,7 +14,8 @@ the PC besides NIS: the server uses only the standard library.
 | `change_objective` | turns the nosepiece and switches NIS's calibration; 4x and 10x only |
 | `list_optical_configs` | the optical configurations defined in NIS (read-only; select one in NIS) |
 | `capture` | one image with the active optical configuration, saved as ND2 in `~/nis-mcp/captures`, by plain file name, never overwriting |
-| `run_experiment` | runs an ND experiment saved in NIS's ND Acquisition window, by name |
+| `list_experiments` | the ND experiments saved in NIS, with each one's loops, time-lapse interval/duration/frames, Z steps and output file (read-only) |
+| `run_experiment` | runs an ND experiment saved in NIS's ND Acquisition window, by name; a name that is not saved is refused |
 | `finish_experiment` | ends the running ND experiment after its current loop |
 | `estop` | `engage` creates the e-stop file `~/.nis-mcp/ESTOP`; `status` reports it |
 
@@ -82,9 +83,16 @@ Never press the JOBS **Abort** button: it freezes NIS.
    the run is over; meanwhile the other tools answer that NIS is busy, so
    `finish_experiment` cannot end it early. Use NIS's **Finish** button in
    the ND Progress window.
-2. **NIS does not say whether a saved ND experiment was found**: if not, it
-   runs whatever the ND Acquisition window holds. List the allowed names in
-   `ALLOWED_EXPERIMENTS`.
+2. **The saved ND experiments are read from NIS's own file**,
+   `C:\ProgramData\Laboratory Imaging\Platform\AX Confocal\ND_Stored.bin`,
+   because no macro function lists them. NIS itself does not say whether a
+   name was found (it runs whatever the ND Acquisition window holds), so
+   `run_experiment` refuses any name not in that file, and refuses
+   everything if the file cannot be read. The format is undocumented: a NIS
+   update could change it, and then `test_reads_this_pcs_saved_experiments`
+   fails. NIS may write the file only when it saves its settings, so an
+   experiment saved a moment ago may not be listed yet. To narrow the
+   choice further, list names in `ALLOWED_EXPERIMENTS`.
 3. **The optical configuration cannot be selected** from here: choose it in
    NIS before `capture`.
 4. **Updating from 0.3.0 by saving the file** leaves capture and the ND

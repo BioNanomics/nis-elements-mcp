@@ -12,7 +12,7 @@ except ImportError:          # off the microscope (tests, python NISMCPServer.py
 # NIS stays responsive. Standard library only.
 #
 # Tools: echo, status, move_relative, change_objective, list_optical_configs,
-# capture, run_experiment, finish_experiment, estop.
+# capture, list_experiments, run_experiment, finish_experiment, estop.
 #
 # Safety:
 #   * nothing moves or starts while the e-stop file exists (~/.nis-mcp/ESTOP).
@@ -21,7 +21,8 @@ except ImportError:          # off the microscope (tests, python NISMCPServer.py
 #   * objective changes only to ALLOWED_MAGNIFICATIONS (4x/10x, whose
 #     working distances cannot reach the dish)
 #   * captures go only into CAPTURE_DIR, by plain file name, never overwriting
-#   * ND runs only of ALLOWED_EXPERIMENTS, when it lists any
+#   * ND runs only of experiments saved in NIS (ND_STORED), and only of
+#     ALLOWED_EXPERIMENTS when it lists any
 #   * finish_experiment and estop are always allowed: they only stop things
 # To change a limit, edit it below and save: the server reloads.
 #
@@ -47,14 +48,16 @@ import json
 import os
 import queue
 import re
+import struct
 import threading
 import time
 import urllib.request
+import zlib
 from pathlib import Path
 
 HOST = "127.0.0.1"
 PORT = int(os.environ.get("NIS_MCP_PORT", "").strip() or 8767)
-NAME, VERSION = "nis-mcp-server", "0.4.0"
+NAME, VERSION = "nis-mcp-server", "0.5.0"
 WATCH_S = 1.0                   # how often to look for a changed file
 PROTOCOL_VERSIONS = ("2025-11-25", "2025-06-18", "2025-03-26")   # newest first
 
@@ -62,6 +65,9 @@ ALLOWED_MAGNIFICATIONS = (4.0, 10.0)
 MAX_STEP_UM = 1000.0            # largest XY step per call, per axis
 CAPTURE_DIR = Path.home() / "nis-mcp" / "captures"
 ALLOWED_EXPERIMENTS = ()        # saved ND experiment names; empty: any
+# where NIS keeps the saved ND experiments (the "AX Confocal" profile)
+ND_STORED = (Path(os.environ.get("PROGRAMDATA") or r"C:\ProgramData")
+             / "Laboratory Imaging" / "Platform" / "AX Confocal" / "ND_Stored.bin")
 ESTOP = Path(os.environ.get("NIS_ESTOP_FILE", "").strip() or Path.home() / ".nis-mcp" / "ESTOP")
 TURRET_SETTLE_S = 25.0          # how long to wait for the nosepiece to arrive
 TURRET_POLL_S = 0.25
@@ -359,12 +365,119 @@ def capture(args: dict) -> dict:
     return out
 
 
+# Saved ND experiments. No macro function lists them, so they are read from
+# the file NIS keeps them in, ND_STORED: "LV0Z", the uncompressed length
+# (uint32), 4 zero bytes, then zlib of NIS's LV records. A record is a type
+# byte, the name's length in UTF-16 units (with its NUL), the name, then the
+# value; a group (type 11) holds its child count (uint32), its length from
+# the record's start (uint64), the children, and an 8-byte offset per child.
+# The format is undocumented, worked out from NIS 6.20's file on this PC
+# (2026-11-03); the parser refuses anything it does not recognise exactly.
+_LV_FIXED = {1: "<?", 2: "<i", 3: "<I", 4: "<q", 5: "<Q", 6: "<d", 7: "<Q"}
+_LV_GROUP, _LV_STRING, _LV_BYTES = 11, 8, 9
+_ND_LOOPS = {"Time": "time", "Multipoint": "xy_points", "ZStack": "z_stack",
+             "Lambda": "lambda", "LargeImage": "large_image"}
+
+
+def _lv_parse(d: bytes, pos: int, end: int) -> dict:
+    out = {}
+    while pos < end:
+        t, n = d[pos], d[pos + 1]
+        name = d[pos + 2:pos + 2 + 2 * n].decode("utf-16-le").rstrip("\0")
+        p = pos + 2 + 2 * n
+        if t in _LV_FIXED:
+            v = struct.unpack_from(_LV_FIXED[t], d, p)[0]
+            p += struct.calcsize(_LV_FIXED[t])
+        elif t == _LV_STRING:
+            e = p
+            while d[e:e + 2] != b"\0\0":
+                e += 2
+            v, p = d[p:e].decode("utf-16-le"), e + 2
+        elif t == _LV_BYTES:
+            size = struct.unpack_from("<Q", d, p)[0]
+            v, p = d[p + 8:p + 8 + size], p + 8 + size
+        elif t == _LV_GROUP:
+            count, length = struct.unpack_from("<IQ", d, p)
+            v = _lv_parse(d, p + 12, pos + length)
+            p = pos + length + 8 * count
+        else:
+            raise ValueError(f"unknown record type {t} at byte {pos}")
+        key, i = name, 1
+        while key in out:                       # repeated names (list items) kept apart
+            key, i = f"{name}#{i}", i + 1
+        out[key] = v
+        pos = p
+    if pos != end:
+        raise ValueError(f"records end at byte {pos}, not {end}")
+    return out
+
+
+def saved_experiments(path: "Path | None" = None) -> dict:
+    """{saved name: its settings} from ND_STORED. OSError/ValueError if unreadable."""
+    raw = Path(path or ND_STORED).read_bytes()
+    if raw[:4] != b"LV0Z":
+        raise ValueError("not an LV0Z file")
+    try:
+        d = zlib.decompress(raw[12:])
+    except zlib.error as e:
+        raise ValueError(f"cannot decompress: {e}") from None
+    if struct.unpack_from("<I", raw, 4)[0] != len(d):
+        raise ValueError("length in the header does not match")
+    try:
+        root = _lv_parse(d, 0, len(d))
+    except (IndexError, struct.error, UnicodeDecodeError) as e:
+        raise ValueError(f"unexpected layout: {e}") from None
+    stored = root.get("StoredSettings")
+    if not isinstance(stored, dict):
+        raise ValueError("no StoredSettings group")
+    return {name: v["SLxExperiment"].get("NDAcquisition", {}) for name, v in stored.items()
+            if isinstance(v, dict) and isinstance(v.get("SLxExperiment"), dict)}
+
+
+def _summary(name: str, acq: dict) -> dict:
+    """What a saved experiment does, from the settings it is known to keep."""
+    tabs, top = acq.get("Tabs", {}), acq.get("NDAcquisitionTop", {})
+    loops = [label for tab, label in _ND_LOOPS.items() if tabs.get(f"b{tab}Checked")]
+    out = {"name": name, "loops": loops}
+    if "time" in loops:
+        phases = acq.get("NDAcquisitionTimelapse", {}).get("aData", {}).values()
+        out["time"] = [{"interval_s": p.get("dInterval", 0) / 1000, "duration_s": p.get("dDuration", 0) / 1000,
+                        "frames": p.get("uiCount")} for p in phases if isinstance(p, dict)]
+    if "z_stack" in loops:
+        z = acq.get("NDAcquisitionZStack", {}).get("ZStack", {})
+        out["z_stack"] = {"steps": z.get("ZStack_Steps"), "step_um": z.get("ZStack_Step")}
+    if top.get("sFileName"):
+        out["saves_to"] = str(Path(top.get("sPath", "")) / top["sFileName"])
+    return out
+
+
+def list_experiments(args: dict) -> dict:
+    try:
+        saved = saved_experiments()
+        written = datetime.datetime.fromtimestamp(ND_STORED.stat().st_mtime).isoformat(timespec="seconds")
+    except (OSError, ValueError) as e:
+        return {"error": f"cannot read the saved ND experiments in {ND_STORED}: {e}"}
+    return {"experiments": [_summary(n, a) for n, a in saved.items()],
+            "file": str(ND_STORED), "file_written": written}
+
+
 def run_experiment(args: dict) -> dict:
     name = args.get("experiment")
     if not isinstance(name, str) or not name:
         return {"error": "run_experiment needs the saved 'experiment' name"}
     if ALLOWED_EXPERIMENTS and name not in ALLOWED_EXPERIMENTS:
         return {"error": f"ND experiment {name!r} is not in ALLOWED_EXPERIMENTS ({', '.join(ALLOWED_EXPERIMENTS)})"}
+    # NIS runs whatever its ND window holds when the name is not found, so an
+    # unknown name - or a list that cannot be read - is refused here.
+    try:
+        saved = list(saved_experiments())
+    except (OSError, ValueError) as e:
+        return {"error": f"cannot check the name: the saved ND experiments in {ND_STORED} "
+                         f"did not read ({e})"}
+    if name not in saved:
+        return {"error": f"no saved ND experiment is named {name!r}. NIS may write {ND_STORED.name} "
+                         "only when it saves settings, so an experiment saved just now may not be "
+                         "listed yet", "saved": saved}
     if (r := _stopped("ND run")):
         return r
     with nis().held() as m:
@@ -456,11 +569,17 @@ TOOLS = [
                      "folders; .nd2 is added. An existing file is never overwritten. Returns the path.",
       "inputSchema": _schema(filename=_STRING)},
      capture),
+    ({"name": "list_experiments",
+      "description": "Read-only: the ND experiments saved in NIS's ND Acquisition window, with the loops "
+                     "each one uses (time, xy_points, z_stack, lambda, large_image), its time-lapse "
+                     "interval, duration and frame count, its Z steps, and the file it saves to. "
+                     "Read this before run_experiment: a long time-lapse holds NIS for its whole duration.",
+      "inputSchema": _schema()},
+     list_experiments),
     ({"name": "run_experiment",
       "description": "Start an ND experiment that was set up and SAVED in NIS's ND Acquisition window, by "
-                     "its saved name, with exactly its saved settings. NIS does not say whether the name "
-                     "was found: if not, it runs whatever the ND Acquisition window holds, so check the "
-                     "name with the operator first. Returns only when the run ends; meanwhile the other "
+                     "its saved name (see list_experiments), with exactly its saved settings. A name "
+                     "that is not saved is refused. Returns only when the run ends; meanwhile the other "
                      "tools answer that NIS is busy.",
       "inputSchema": _schema(experiment=_STRING)},
      run_experiment),
