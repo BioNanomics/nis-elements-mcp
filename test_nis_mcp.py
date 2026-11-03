@@ -2,10 +2,12 @@
 import base64
 import json
 import sqlite3
+import struct
 import threading
 import time
 import urllib.error
 import urllib.request
+import zlib
 
 import pytest
 
@@ -39,7 +41,8 @@ def test_handshake_list_and_echo(url):
     assert post(url + "/mcp", {"jsonrpc": "2.0", "method": "notifications/initialized"})[0] == 202
     tools = post(url + "/mcp", {"jsonrpc": "2.0", "id": 2, "method": "tools/list"})[1]["result"]["tools"]
     assert [t["name"] for t in tools] == ["echo", "status", "move_relative", "change_objective",
-                                          "list_optical_configs", "capture", "run_experiment",
+                                          "list_optical_configs", "capture", "list_experiments",
+                                          "run_experiment",
                                           "finish_experiment", "estop"]
     out = post(url + "/mcp", {"jsonrpc": "2.0", "id": 3, "method": "tools/call",
                               "params": {"name": "echo", "arguments": {"text": "hello NIS"}}})[1]
@@ -240,9 +243,51 @@ def scope(monkeypatch, tmp_path):
     fake = FakeScope()
     monkeypatch.setattr(server, "_nis", server.NIS(fake))
     monkeypatch.setattr(server, "ESTOP", tmp_path / "ESTOP")
+    monkeypatch.setattr(server, "ND_STORED", tmp_path / "ND_Stored.bin")
+    write_nd_stored(server.ND_STORED, {n: experiment() for n in ("C. elegans 3h", "long", "e")})
     monkeypatch.setattr(server, "CAPTURE_DIR", tmp_path / "captures")
     monkeypatch.setattr(server, "_ui", server.MainThread())     # not installed, as off NIS
     return fake
+
+
+def lv(name: str, value) -> bytes:
+    """One record in NIS's LV format, as ND_Stored.bin holds them."""
+    head = lambda t: bytes([t, len(name) + 1]) + (name + "\0").encode("utf-16-le")
+    if isinstance(value, dict):
+        body = b"".join(lv(k.split("#")[0], v) for k, v in value.items())
+        h = head(11)
+        return h + struct.pack("<IQ", len(value), len(h) + 12 + len(body)) + body + b"\0" * 8 * len(value)
+    if isinstance(value, bool):
+        return head(1) + struct.pack("<?", value)
+    if isinstance(value, int):
+        return head(3) + struct.pack("<I", value)
+    if isinstance(value, float):
+        return head(6) + struct.pack("<d", value)
+    if isinstance(value, bytes):
+        return head(9) + struct.pack("<Q", len(value)) + value
+    return head(8) + (value + "\0").encode("utf-16-le")
+
+
+def write_nd_stored(path, experiments: dict) -> None:
+    raw = lv("StoredSettings", {n: {"SLxExperiment": {"NDAcquisition": a}} for n, a in experiments.items()})
+    path.write_bytes(b"LV0Z" + struct.pack("<I", len(raw)) + b"\0" * 4 + zlib.compress(raw))
+
+
+def experiment(time=(), z=None, xy=False, file=None) -> dict:
+    """NDAcquisition settings as NIS 6.20 saves them, cut down to what list_experiments reads."""
+    phases = {f"#{i}": {"eType": 0, "dInterval": iv, "dDuration": du, "uiCount": n}
+              for i, (iv, du, n) in enumerate(time)}
+    top = {"sName": "x", "bSaveToFile": True}
+    if file:
+        top.update(sPath=file[0], sFileName=file[1])
+    return {"NDAcquisitionTop": top,
+            "Tabs": {"bTimeChecked": bool(time), "bMultipointChecked": xy, "bZStackChecked": bool(z),
+                     "bLambdaChecked": False, "bLargeImageChecked": False},
+            "NDAcquisitionTimelapse": {"aData": phases},
+            "NDAcquisitionMultipoint": {"NDAcquisitionListOfPoints": {"pData": b"\1\2"}},
+            "NDAcquisitionZStack": {"ZStack": {"ZStack_Steps": z[0] if z else 0,
+                                               "ZStack_Step": z[1] if z else 0.0}},
+            "uiOrder": 0}
 
 
 @pytest.fixture
@@ -362,6 +407,52 @@ def test_run_and_finish_experiment(scope, main_thread, monkeypatch):
     monkeypatch.setattr(server, "ALLOWED_EXPERIMENTS", ("Embryo 1h",))
     out, err = tool("run_experiment", experiment="C. elegans 3h")
     assert err and "ALLOWED_EXPERIMENTS" in out["error"]
+
+
+def test_run_experiment_refuses_a_name_that_is_not_saved(scope, main_thread):
+    out, err = tool("run_experiment", experiment="C. elegans 3H")
+    assert err and "no saved ND experiment" in out["error"] and out["saved"] == ["C. elegans 3h", "long", "e"]
+    server.ND_STORED.write_bytes(b"LV0Z garbage")
+    out, err = tool("run_experiment", experiment="C. elegans 3h")
+    assert err and "cannot check the name" in out["error"]
+    server.ND_STORED.unlink()
+    assert "cannot check the name" in tool("run_experiment", experiment="C. elegans 3h")[0]["error"]
+    assert scope.calls == []
+
+
+def test_list_experiments(scope):
+    write_nd_stored(server.ND_STORED, {
+        "Pilot 60s": experiment(time=[(60_000.0, 3_600_000.0, 61)], z=(1, 0.75), file=("D:\\data", "p.nd2")),
+        "Stack": experiment(z=(41, 0.75)),
+        "Grid": experiment(xy=True)})
+    out, err = tool("list_experiments")
+    assert not err and out["file"] == str(server.ND_STORED) and out["file_written"]
+    assert out["experiments"] == [
+        {"name": "Pilot 60s", "loops": ["time", "z_stack"], "z_stack": {"steps": 1, "step_um": 0.75},
+         "time": [{"interval_s": 60.0, "duration_s": 3600.0, "frames": 61}],
+         "saves_to": str(server.Path("D:\\data") / "p.nd2")},
+        {"name": "Stack", "loops": ["z_stack"], "z_stack": {"steps": 41, "step_um": 0.75}},
+        {"name": "Grid", "loops": ["xy_points"]}]
+    assert scope.calls == []
+
+
+@pytest.mark.skipif(not server.ND_STORED.exists(), reason="no NIS on this PC")
+def test_reads_this_pcs_saved_experiments():
+    saved = server.saved_experiments()       # raises if a NIS update changed the format
+    assert saved and all("Tabs" in a for a in saved.values())
+
+
+def test_list_experiments_refuses_a_file_it_does_not_recognise(scope):
+    good = server.ND_STORED.read_bytes()
+    raw = zlib.decompress(good[12:])
+    bad = {"not LV0Z": b"XXXX" + good[4:],
+           "wrong length": good[:4] + struct.pack("<I", len(raw) + 1) + good[8:],
+           "unknown type": good[:12] + zlib.compress(b"\x63" + raw[1:]),
+           "truncated": good[:4] + struct.pack("<I", len(raw) - 3) + good[8:12] + zlib.compress(raw[:-3])}
+    for why, data in bad.items():
+        server.ND_STORED.write_bytes(data)
+        out, err = tool("list_experiments")
+        assert err and "cannot read" in out["error"], why
 
 
 def test_other_tools_answer_busy_while_an_nd_run_blocks(scope, main_thread, monkeypatch):
