@@ -607,7 +607,9 @@ def watch(srv: http.server.ThreadingHTTPServer, run_args: tuple) -> None:
         try:
             spec = importlib.util.spec_from_file_location("NISMCPServer", path)
             new = importlib.util.module_from_spec(spec)
-            spec.loader.exec_module(new)
+            # Compile the file itself: __pycache__ is trusted by size and
+            # whole-second mtime, so a same-size edit within a second ran old code.
+            exec(compile(path.read_bytes(), str(path), "exec"), new.__dict__)
         except Exception as e:
             print(f"NIS MCP server: {path.name} changed but does not load "
                   f"({type(e).__name__}: {e}) - still serving {VERSION}")
