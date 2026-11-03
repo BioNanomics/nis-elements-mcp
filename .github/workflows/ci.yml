@@ -10,6 +10,7 @@ jobs:
   nis-mcp-server:
     runs-on: ${{ matrix.os }}
     strategy:
+      fail-fast: false     # one OS failing should not hide the others' results
       matrix:
         os: [windows-latest, ubuntu-latest]
         python-version: ["3.11", "3.13"]
@@ -26,6 +27,7 @@ jobs:
   bridge:
     runs-on: ${{ matrix.os }}
     strategy:
+      fail-fast: false     # one OS failing should not hide the others' results
       matrix:
         os: [windows-latest, ubuntu-latest]
         python-version: ["3.11", "3.13"]
