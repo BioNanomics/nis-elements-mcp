@@ -57,7 +57,7 @@ from pathlib import Path
 
 HOST = "127.0.0.1"
 PORT = int(os.environ.get("NIS_MCP_PORT", "").strip() or 8767)
-NAME, VERSION = "nis-mcp-server", "0.6.0"
+NAME, VERSION = "nis-mcp-server", "0.6.1"
 WATCH_S = 1.0                   # how often to look for a changed file
 PROTOCOL_VERSIONS = ("2025-11-25", "2025-06-18", "2025-03-26")   # newest first
 
@@ -148,7 +148,8 @@ class NIS:
         x, y, z = ct.c_double(), ct.c_double(), ct.c_double()
         self.StgGetPosXY(ct.byref(x), ct.byref(y))
         self.StgGetPosZ(ct.byref(z), 0)
-        return x.value, y.value, z.value
+        # rounded to 0.01 um: NIS's doubles carry float noise (2817.6000000000004)
+        return round(x.value, 2), round(y.value, 2), round(z.value, 2)
 
     def turret(self) -> "tuple[int, str, dict[int, str]]":
         """(nosepiece position, NIS's current objective, {position: objective name})."""
@@ -469,7 +470,7 @@ def _summary(name: str, acq: dict) -> dict:
     """What a saved experiment does, from the settings it is known to keep."""
     tabs, top = acq.get("Tabs", {}), acq.get("NDAcquisitionTop", {})
     loops = [label for tab, label in _ND_LOOPS.items() if tabs.get(f"b{tab}Checked")]
-    out = {"name": name, "loops": loops, "run_length_s": run_length_s(acq)}
+    out = {"name": name, "loops": loops, **_length_fields(time_lapse_s(acq))}
     if "time" in loops:
         phases = acq.get("NDAcquisitionTimelapse", {}).get("aData", {}).values()
         out["time"] = [{"interval_s": p.get("dInterval", 0) / 1000, "duration_s": p.get("dDuration", 0) / 1000,
@@ -482,7 +483,18 @@ def _summary(name: str, acq: dict) -> dict:
     return out
 
 
-def run_length_s(acq: dict) -> "float | None":
+def _length_fields(length: "float | None") -> dict:
+    """How long an experiment runs, as reported: never a bare 0 for 'no time-lapse'."""
+    if length == 0:
+        return {"time_lapse_s": None, "single_pass": True,
+                "note": "no time-lapse: it runs its other loops once, which still takes the time to "
+                        "acquire them; that time is not known in advance"}
+    if length is None:
+        return {"time_lapse_s": None, "note": "the time-lapse length cannot be worked out"}
+    return {"time_lapse_s": length}
+
+
+def time_lapse_s(acq: dict) -> "float | None":
     """How long a saved experiment's time-lapse lasts, in s: 0 without one, None if unclear."""
     if not acq.get("Tabs", {}).get("bTimeChecked"):
         return 0.0                              # a single pass through the other loops
@@ -526,13 +538,13 @@ def run_experiment(args: dict) -> dict:
         return {"error": f"no saved ND experiment is named {name!r}. NIS may write {ND_STORED.name} "
                          "only when it saves settings, so an experiment saved just now may not be "
                          "listed yet", "saved": list(saved)}
-    length = run_length_s(saved[name])
+    length = time_lapse_s(saved[name])
     if length is None or length > MAX_ND_RUN_S:
         why = "its time-lapse length cannot be worked out" if length is None else \
               f"its time-lapse runs {length / 60:g} min"
         return {"error": f"ND experiment {name!r} refused: {why}, and runs from here are limited to "
                          f"{MAX_ND_RUN_S / 60:g} min (MAX_ND_RUN_S). Start it in NIS, or raise the limit.",
-                "run_length_s": length}
+                "time_lapse_s": length}
     if (r := _stopped("ND run")):
         return r
     global _nd_run
@@ -556,7 +568,7 @@ def run_experiment(args: dict) -> dict:
         _nd_run = {"experiment": name, "started": now.isoformat(timespec="seconds"),
                    "expected_end": (now + datetime.timedelta(seconds=length)).isoformat(timespec="seconds")
                    if length else None,
-                   "run_length_s": length, "xy_um_at_start": list(m.position()[:2])}
+                   **_length_fields(length), "xy_um_at_start": list(m.position()[:2])}
         try:
             return _ui.call(on_main_thread, timeout_s=ND_RUN_TIMEOUT_S)
         finally:

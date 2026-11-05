@@ -469,7 +469,7 @@ def test_run_experiment_refuses_a_long_or_unclear_time_lapse(scope, main_thread)
         "unclear": experiment(time=[(0.0, 0.0, 0)]),
         "stack": experiment(z=(41, 0.75))})
     out, err = tool("run_experiment", experiment="two phases")
-    assert err and "40 min" in out["error"] and out["run_length_s"] == 2400
+    assert err and "40 min" in out["error"] and out["time_lapse_s"] == 2400
     out, err = tool("run_experiment", experiment="overnight")
     assert err and "450 min" in out["error"] and "MAX_ND_RUN_S" in out["error"]
     assert "cannot be worked out" in tool("run_experiment", experiment="unclear")[0]["error"]
@@ -488,12 +488,12 @@ def test_list_experiments(scope):
     out, err = tool("list_experiments")
     assert not err and out["file"] == str(server.ND_STORED) and out["file_written"]
     assert out["experiments"] == [
-        {"name": "Pilot 60s", "loops": ["time", "z_stack"], "run_length_s": 3600.0,
+        {"name": "Pilot 60s", "loops": ["time", "z_stack"], "time_lapse_s": 3600.0,
          "z_stack": {"steps": 1, "step_um": 0.75},
          "time": [{"interval_s": 60.0, "duration_s": 3600.0, "frames": 61}],
          "saves_to": str(server.Path("D:\\data") / "p.nd2")},
-        {"name": "Stack", "loops": ["z_stack"], "run_length_s": 0.0, "z_stack": {"steps": 41, "step_um": 0.75}},
-        {"name": "Grid", "loops": ["xy_points"], "run_length_s": 0.0}]
+        {"name": "Stack", "loops": ["z_stack"], "time_lapse_s": None, "single_pass": True, "note": server._length_fields(0)["note"], "z_stack": {"steps": 41, "step_um": 0.75}},
+        {"name": "Grid", "loops": ["xy_points"], "time_lapse_s": None, "single_pass": True, "note": server._length_fields(0)["note"]}]
     assert scope.calls == []
 
 
@@ -547,7 +547,7 @@ def test_status_reports_when_an_nd_run_should_end(scope, main_thread):
     scope.nd_blocks.set()
     run.join()
     started, end = (server.datetime.datetime.fromisoformat(r[k]) for k in ("started", "expected_end"))
-    assert (end - started).total_seconds() == 90 and r["run_length_s"] == 90
+    assert (end - started).total_seconds() == 90 and r["time_lapse_s"] == 90
 
 
 def test_estop_engages_and_cannot_release(scope):
@@ -615,3 +615,11 @@ def test_install_creates_then_updates(jobs_db, tmp_path):
     assert ij.install(jobs_db, "MCPServer", srv_file, backup=False).startswith("updated")
     assert job(jobs_db, "MCPServer")[:2] == (2, 2)                      # same job, new program row
     assert ij.get_script(job(jobs_db, "OldPython")[2]["data"]) == "print('old')"   # template untouched
+
+
+def test_positions_are_rounded(scope):
+    scope.x, scope.y, scope.z = 1717.6000000000004, -1399.7000000000003, 488.66000000001
+    out, err = tool("status")
+    assert not err and out["xy_um"] == [1717.6, -1399.7] and out["z_um"] == 488.66
+    out, err = tool("move_relative", dx_um=100, dy_um=0)
+    assert not err and out["after_um"] == [1817.6, -1399.7]

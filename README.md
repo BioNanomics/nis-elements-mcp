@@ -14,7 +14,7 @@ the PC besides NIS: the server uses only the standard library.
 | `change_objective` | turns the nosepiece and switches NIS's calibration; 4x and 10x only |
 | `list_optical_configs` | the optical configurations defined in NIS (read-only; select one in NIS) |
 | `capture` | one image with the active optical configuration, saved as ND2 in `~/nis-mcp/captures`, by plain file name, never overwriting |
-| `list_experiments` | the ND experiments saved in NIS, with each one's loops, run length, time-lapse interval/duration/frames, Z steps and output file (read-only) |
+| `list_experiments` | the ND experiments saved in NIS, with each one's loops, time-lapse length (or "single pass"), interval/duration/frames, Z steps and output file (read-only) |
 | `run_experiment` | runs an ND experiment saved in NIS's ND Acquisition window, by name; a name that is not saved, or a time-lapse over 30 min, is refused |
 | `finish_experiment` | ends the running ND experiment after its current loop |
 | `estop` | `engage` creates the e-stop file `~/.nis-mcp/ESTOP`; `status` reports it |
