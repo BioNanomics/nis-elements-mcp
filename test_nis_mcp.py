@@ -47,8 +47,9 @@ def test_handshake_list_and_echo(url):
     assert "Never answer from what an earlier call returned" in out["result"]["instructions"]
     assert post(url + "/mcp", {"jsonrpc": "2.0", "method": "notifications/initialized"})[0] == 202
     tools = post(url + "/mcp", {"jsonrpc": "2.0", "id": 2, "method": "tools/list"})[1]["result"]["tools"]
-    assert [t["name"] for t in tools] == ["echo", "status", "move_relative", "change_objective",
-                                          "list_optical_configs", "capture", "list_experiments",
+    assert [t["name"] for t in tools] == ["echo", "status", "move_relative", "focus_down", "change_objective",
+                                          "list_optical_configs", "imaging_status", "capture",
+                                          "list_experiments",
                                           "run_experiment",
                                           "finish_experiment", "estop"]
     out = post(url + "/mcp", {"jsonrpc": "2.0", "id": 3, "method": "tools/call",
@@ -176,6 +177,11 @@ class FakeScope:
         pz._obj.value = self.z
         return 1
 
+    def StgMoveZ(self, dz, relative):
+        assert relative == server.MOVE_RELATIVE
+        self.z += dz
+        return self._record("z", dz)
+
     def StgMoveXY(self, dx, dy, relative):
         assert relative == server.MOVE_RELATIVE
         self.x += dx
@@ -242,6 +248,47 @@ class FakeScope:
     def ChangeObjective(self, name):
         self.calls.append(("calibrate", name))
         self.cal = name
+        return 1
+
+    # imaging state and the current image
+    light_path, shutters = 2, {"EPI": 0, "DIA": 1}
+    image = (40, 30, 12, 2)                 # width, height, bits, channels
+    pixel = staticmethod(lambda r, c, k: 5 * k + r // 10)   # nearly blank, as the dark capture on 2026-11-05
+
+    def GetSelectedOptConf(self, obj, cam, mic, n):
+        obj.value, cam.value, mic.value = "", "Nikon AX:DIC_10x", "Nikon AX:DIC_10x"
+        return 1
+
+    def Stg_IsLightPathPresent(self):
+        return 1
+
+    def Stg_GetLightPathPosition(self):
+        return self.light_path
+
+    def Stg_GetLightPathPositions(self):
+        return 4
+
+    def Stg_GetShutterCount(self):
+        return len(self.shutters)
+
+    def Stg_GetShutterName(self, i, buf, n):
+        buf.value = list(self.shutters)[i]
+        return 1
+
+    def Stg_GetShutterStateEx(self, name):
+        return self.shutters[name]
+
+    def Get_ImageInfo(self, name, w, h, bits, planes):
+        assert name == ""                   # the current image
+        if self.image is None:
+            return -1
+        w._obj.value, h._obj.value, bits._obj.value, planes._obj.value = self.image
+        return 1
+
+    def GetPixelValueEx(self, doc, undo, r, c, comp):
+        assert (doc, undo) == (-1, 0) and 0 <= r < self.image[1] and 0 <= c < self.image[0]
+        for k in range(self.image[3]):
+            comp[k] = self.pixel(r, c, k)
         return 1
 
 
@@ -365,7 +412,8 @@ def test_status(scope):
     assert not err and out == {"xy_um": [100.0, 200.0], "z_um": 4619.0, "objective": "Plan Fluor 4x",
                                "nosepiece_position": 1, "nd_running": False, "estop_engaged": False,
                                "nosepiece": {"0": "Plan Apo 20x", "1": "Plan Fluor 4x", "2": "Plan Apo 10x"},
-                               "xy_limits_um": [[-2000.0, 2000.0], [-2000.0, 2000.0]]}
+                               "xy_limits_um": [[-2000.0, 2000.0], [-2000.0, 2000.0]],
+                               "z_devices": {"0": {"z_um": 4619.0, "rc": 1}, "1": {"z_um": 4619.0, "rc": 1}}}
 
 
 def test_move_relative_and_its_refusals(scope):
@@ -424,6 +472,52 @@ def test_capture_runs_on_the_main_thread(scope, main_thread):
     for bad in ("../up", "D:\\data\\x", "", ".hidden"):
         assert tool("capture", filename=bad)[1], bad
     assert len(scope.calls) == 3
+
+
+def test_imaging_status(scope, monkeypatch):
+    monkeypatch.setattr(server, "LIGHT_PATH_NAMES", {2: "L100"})
+    out, err = tool("imaging_status")
+    assert not err
+    assert out["optical_config"]["camera"] == "Nikon AX:DIC_10x"
+    assert out["light_path"] == {"port": 2, "port_name": "L100", "ports": 4}
+    assert out["shutters"] == {"EPI": "closed", "DIA": "open"} and out["estop_engaged"] is False
+
+
+def test_capture_reports_intensity_and_warns_on_low_signal(scope, main_thread):
+    out, err = tool("capture", filename="stats")
+    assert not err and out["saved"]
+    img = out["image"]
+    assert (img["width"], img["height"], img["bits"], img["full_scale"]) == (40, 30, 12, 4095)
+    assert img["sampled_pixels"] == 40 * 30                 # smaller than the grid: every pixel
+    ch0, ch1 = img["channels"]
+    assert (ch0["min"], ch0["max"], ch1["min"], ch1["max"]) == (0, 2, 5, 7)
+    assert ch0["saturated_fraction"] == 0
+    assert out["imaging"]["light_path"]["port"] == 2
+    assert len(out["warnings"]) == 1 and "low signal" in out["warnings"][0]     # 7 < 1% of 4095
+    assert [c[0] for c in scope.calls] == ["capture", "save", "close"]
+
+
+def test_capture_bright_and_saturated(scope, main_thread):
+    scope.pixel = lambda r, c, k: 4095 if r < 3 else 2000                  # 10% saturated
+    out, err = tool("capture", filename="bright")
+    assert not err and out["image"]["channels"][0]["saturated_fraction"] == 0.1
+    assert all("saturated" in w for w in out["warnings"]) and len(out["warnings"]) == 2
+
+
+def test_capture_samples_a_grid_of_a_large_image(scope, main_thread, monkeypatch):
+    monkeypatch.setattr(server, "IMAGE_SAMPLE_GRID", 16)
+    scope.image = (1024, 512, 16, 1)
+    scope.pixel = lambda r, c, k: 30000
+    out, err = tool("capture", filename="big")
+    assert not err and "warnings" not in out
+    assert out["image"]["sampled_pixels"] == 16 * 16 and out["image"]["channels"][0]["p50"] == 30000
+
+
+def test_capture_keeps_the_file_when_the_image_cannot_be_read(scope, main_thread):
+    scope.image = None
+    out, err = tool("capture", filename="noinfo")
+    assert not err and out["saved"] and "error" in out["image"] and "warnings" not in out
+    assert [c[0] for c in scope.calls] == ["capture", "save", "close"]
 
 
 def test_capture_and_nd_refused_without_the_main_thread_hook(scope):
@@ -623,3 +717,23 @@ def test_positions_are_rounded(scope):
     assert not err and out["xy_um"] == [1717.6, -1399.7] and out["z_um"] == 488.66
     out, err = tool("move_relative", dx_um=100, dy_um=0)
     assert not err and out["after_um"] == [1817.6, -1399.7]
+
+
+def test_focus_down_only_lowers(scope, monkeypatch):
+    out, err = tool("focus_down", down_um=50)
+    assert not err and out["z_before_um"] == 4619.0 and out["z_after_um"] == 4569.0
+    for bad in (-10, 0, 201, float("nan"), "up"):                 # nothing can raise it
+        out, err = tool("focus_down", down_um=bad)
+        assert err, bad
+    monkeypatch.setattr(server, "Z_MIN_UM", 4500.0)
+    out, err = tool("focus_down", down_um=100)
+    assert err and "below Z_MIN_UM" in out["error"]
+    server.ESTOP.write_text("")
+    assert "e-stop" in tool("focus_down", down_um=1)[0]["error"]
+    assert scope.calls == [("z", -50.0)]
+
+
+def test_focus_down_reports_a_z_drive_that_did_not_move(scope):
+    scope.StgMoveZ = lambda dz, rel: 1                           # accepts, never moves
+    out, err = tool("focus_down", down_um=10)
+    assert err and "did not go down" in out["error"]

@@ -11,13 +11,15 @@ except ImportError:          # off the microscope (tests, python NISMCPServer.py
 # Streamable HTTP transport on http://127.0.0.1:8767/mcp and returns, so
 # NIS stays responsive. Standard library only.
 #
-# Tools: echo, status, move_relative, change_objective, list_optical_configs,
-# capture, list_experiments, run_experiment, finish_experiment, estop.
+# Tools: echo, status, move_relative, focus_down, change_objective, list_optical_configs,
+# imaging_status, capture, list_experiments, run_experiment, finish_experiment, estop.
 #
 # Safety:
 #   * nothing moves or starts while the e-stop file exists (~/.nis-mcp/ESTOP).
 #     The estop tool engages it; only a person releases it, by deleting the file
-#   * XY moves are relative, at most MAX_STEP_UM per axis; Z never moves
+#   * XY moves are relative, at most MAX_STEP_UM per axis, inside XY_LIMITS_UM
+#   * Z only goes down (focus_down: away from the sample), MAX_Z_DOWN_UM per call;
+#     nothing here raises the objective
 #   * objective changes only to ALLOWED_MAGNIFICATIONS (4x/10x, whose
 #     working distances cannot reach the dish)
 #   * captures go only into CAPTURE_DIR, by plain file name, never overwriting
@@ -57,18 +59,28 @@ from pathlib import Path
 
 HOST = "127.0.0.1"
 PORT = int(os.environ.get("NIS_MCP_PORT", "").strip() or 8767)
-NAME, VERSION = "nis-mcp-server", "0.6.1"
+NAME, VERSION = "nis-mcp-server", "0.8.0"
 WATCH_S = 1.0                   # how often to look for a changed file
 PROTOCOL_VERSIONS = ("2025-11-25", "2025-06-18", "2025-03-26")   # newest first
 
 ALLOWED_MAGNIFICATIONS = (4.0, 10.0)
 MAX_STEP_UM = 1000.0            # largest XY step per call, per axis
+# Z: on this inverted Ti2 a larger Z raises the objective towards the sample.
+# focus_down only lowers it (away from the sample), never below Z_MIN_UM.
+MAX_Z_DOWN_UM = 200.0           # largest focus_down step per call
+Z_MIN_UM = 0.0
 # The XY area moves may not leave, ((x_min, x_max), (y_min, y_max)) in um, as
 # status reports the stage. None refuses every move. TEMPORARY: +-2 mm around
 # where the stage was on 2026-11-03 with no sample; measure the real safe
 # area for the holder in use (move there in NIS, read status) and set it here.
 XY_LIMITS_UM = ((-4102.4, -102.4), (-3599.5, 400.5))
 CAPTURE_DIR = Path.home() / "nis-mcp" / "captures"
+IMAGE_SAMPLE_GRID = 64          # capture reads a 64 x 64 grid of pixels for its intensity stats
+LOW_SIGNAL_FRACTION = 0.01      # warn when the brightest channel's p99 is under 1% of full scale
+SATURATED_FRACTION = 0.01       # warn when over 1% of a channel's sampled pixels are saturated
+# Light path port numbers -> names, as NIS shows them (fill in on the scope:
+# switch ports in NIS and read imaging_status). Unlisted ports show no name.
+LIGHT_PATH_NAMES: "dict[int, str]" = {}
 LOG_FILE = Path.home() / "nis-mcp" / "log.jsonl"   # one JSON line per tool call
 ALLOWED_EXPERIMENTS = ()        # saved ND experiment names; empty: any
 MAX_ND_RUN_S = 30 * 60.0        # longest time-lapse run_experiment starts (an ND run holds NIS)
@@ -103,6 +115,7 @@ class NIS:
         "StgGetPosXY": [ct.POINTER(ct.c_double), ct.POINTER(ct.c_double)],
         "StgGetPosZ": [ct.POINTER(ct.c_double), ct.c_int],
         "StgMoveXY": [ct.c_double, ct.c_double, ct.c_int],
+        "StgMoveZ": [ct.c_double, ct.c_int],
         "GetCurrentObjName": [ct.c_wchar_p],
         "Stg_GetNosepiecePosition": [],
         "Stg_GetNosepiecePositions": [],
@@ -118,6 +131,15 @@ class NIS:
         "ND_RunExperiment": [ct.c_int],
         "ND_IsInExperimentCapture": [],
         "ND_FinishExperiment": [],
+        "GetSelectedOptConf": [ct.c_wchar_p, ct.c_wchar_p, ct.c_wchar_p, ct.c_int],
+        "Stg_IsLightPathPresent": [],
+        "Stg_GetLightPathPosition": [],
+        "Stg_GetLightPathPositions": [],
+        "Stg_GetShutterCount": [],
+        "Stg_GetShutterName": [ct.c_int, ct.c_wchar_p, ct.c_int],
+        "Stg_GetShutterStateEx": [ct.c_wchar_p],
+        "Get_ImageInfo": [ct.c_wchar_p] + [ct.POINTER(ct.c_int)] * 4,
+        "GetPixelValueEx": [ct.c_int, ct.c_int, ct.c_int, ct.c_int, ct.POINTER(ct.c_int)],
     }
 
     def __init__(self, dll=None):
@@ -161,6 +183,73 @@ class NIS:
             if self.Stg_GetNosepieceObjectiveName(i, b, 255) == 1 and b.value:
                 names[i] = b.value
         return self.Stg_GetNosepiecePosition(), cur.value, names
+
+    def imaging(self) -> dict:
+        """What decides how an image is taken: the active optical configurations,
+        the light path port and the shutters (read-only)."""
+        obj, cam, mic = (ct.create_unicode_buffer(256) for _ in range(3))
+        self.GetSelectedOptConf(obj, cam, mic, 255)
+        out = {"optical_config": {"objective": obj.value, "camera": cam.value, "microscope": mic.value}}
+        if self.Stg_IsLightPathPresent() == 1:
+            port = self.Stg_GetLightPathPosition()
+            out["light_path"] = {"port": port, "port_name": LIGHT_PATH_NAMES.get(port),
+                                 "ports": self.Stg_GetLightPathPositions()}
+        else:
+            out["light_path"] = None
+        shutters = {}
+        for i in range(max(self.Stg_GetShutterCount(), 0)):
+            b = ct.create_unicode_buffer(255)
+            self.Stg_GetShutterName(i, b, 255)
+            if b.value:
+                rc = self.Stg_GetShutterStateEx(b.value)
+                shutters[b.value] = "open" if rc == 1 else "closed" if rc == 0 else f"unknown (rc {rc})"
+        out["shutters"] = shutters
+        return out
+
+    def image_stats(self, grid: int) -> dict:
+        """Intensity of NIS's current image, from a grid x grid sample of its
+        pixels (GetPixelValueEx per pixel: reading every one would be slow)."""
+        w, h, bits, planes = (ct.c_int() for _ in range(4))
+        if self.Get_ImageInfo("", ct.byref(w), ct.byref(h), ct.byref(bits), ct.byref(planes)) < 0 \
+                or min(w.value, h.value, bits.value, planes.value) <= 0:
+            return {"error": "NIS did not describe the captured image (Get_ImageInfo)"}
+        w, h, bits, planes = w.value, h.value, bits.value, planes.value
+        comp = (ct.c_int * max(planes, 16))()
+        rows = sorted({int((i + 0.5) * h / min(grid, h)) for i in range(min(grid, h))})
+        cols = sorted({int((i + 0.5) * w / min(grid, w)) for i in range(min(grid, w))})
+        values = [[] for _ in range(planes)]
+        for r in rows:
+            for c in cols:
+                self.GetPixelValueEx(-1, 0, r, c, comp)
+                for k in range(planes):
+                    values[k].append(comp[k])
+        full = 2 ** bits - 1
+        channels = []
+        for v in values:
+            v.sort()
+            pct = lambda p: v[min(len(v) - 1, int(p / 100 * len(v)))]
+            channels.append({"min": v[0], "max": v[-1], "mean": round(sum(v) / len(v), 1),
+                             "p1": pct(1), "p50": pct(50), "p99": pct(99),
+                             "saturated_fraction": round(sum(x >= full for x in v) / len(v), 4)})
+        return {"width": w, "height": h, "bits": bits, "full_scale": full,
+                "sampled_pixels": len(rows) * len(cols), "channels": channels}
+
+
+def signal_warnings(stats: dict) -> "list[str]":
+    """Warnings, not errors: a real sample can be dark, or bright."""
+    if "channels" not in stats:
+        return []
+    full, out = stats["full_scale"], []
+    brightest = max(c["p99"] for c in stats["channels"])
+    if brightest < LOW_SIGNAL_FRACTION * full:
+        out.append(f"low signal: the brightest channel's 99th percentile is {brightest} of {full} "
+                   f"(under {LOW_SIGNAL_FRACTION:.0%} of full scale). The image may be nearly blank: check the "
+                   "light path (camera, not eyepieces), shutters, laser or lamp, and focus - or the sample "
+                   "may simply be dark.")
+    for i, c in enumerate(stats["channels"]):
+        if c["saturated_fraction"] > SATURATED_FRACTION:
+            out.append(f"channel {i}: {c['saturated_fraction']:.1%} of sampled pixels are saturated")
+    return out
 
 
 _nis = None
@@ -282,9 +371,14 @@ def status(args: dict) -> dict:
         x, y, z = m.position()
         pos, cur, names = m.turret()
         nd = bool(m.ND_IsInExperimentCapture())
+        z_devices = {}
+        for dev in (0, 1):                      # primary and secondary Z device
+            v = ct.c_double()
+            rc = m.StgGetPosZ(ct.byref(v), dev)
+            z_devices[str(dev)] = {"z_um": round(v.value, 2), "rc": rc}
     return {"xy_um": [x, y], "z_um": z, "objective": cur, "nosepiece_position": pos,
             "nosepiece": names, "nd_running": nd, "estop_engaged": estop_engaged(),
-            "xy_limits_um": XY_LIMITS_UM}
+            "xy_limits_um": XY_LIMITS_UM, "z_devices": z_devices}
 
 
 def move_relative(args: dict) -> dict:
@@ -309,6 +403,31 @@ def move_relative(args: dict) -> dict:
         rc = m.StgMoveXY(dx, dy, MOVE_RELATIVE)
         after = m.position()[:2]
     return {"before_um": list(before), "after_um": list(after), "rc": rc}
+
+
+def focus_down(args: dict) -> dict:
+    # Only ever lowers the objective: moving away from the sample cannot hit
+    # it. Raising is left to a person, who can see the gap to the dish.
+    try:
+        down = float(args["down_um"])
+    except (KeyError, TypeError, ValueError):
+        return {"error": "focus_down needs a number 'down_um'"}
+    if not 0 < down <= MAX_Z_DOWN_UM:                               # also refuses nan
+        return {"error": f"down_um must be above 0 and at most {MAX_Z_DOWN_UM:g} um, got {down:g}. "
+                         "This tool only lowers the objective; raising it is for a person"}
+    if (r := _stopped("focus")):
+        return r
+    with nis().held() as m:
+        before = m.position()[2]
+        if before - down < Z_MIN_UM:
+            return {"error": f"Z would go to {before - down:g} um, below Z_MIN_UM {Z_MIN_UM:g}",
+                    "z_um": before}
+        rc = m.StgMoveZ(-down, MOVE_RELATIVE)
+        after = m.position()[2]
+    out = {"z_before_um": before, "z_after_um": after, "rc": rc}
+    if not after < before:
+        out["error"] = "Z did not go down: check the Z drive in NIS"
+    return out
 
 
 def change_objective(args: dict) -> dict:
@@ -386,14 +505,32 @@ def capture(args: dict) -> dict:
         def on_main_thread() -> dict:
             if (r := _stopped("capture")):          # re-check: the call may have waited in the queue
                 return r
+            imaging = m.imaging()
             rc_capture = m.Capture()
             rc_save = m.ImageSaveAs(str(path), ND2_ALL_LAYERS, 0)
+            try:                                    # the file is saved: stats must not lose it
+                stats = m.image_stats(IMAGE_SAMPLE_GRID)
+            except Exception as e:
+                stats = {"error": f"could not read the image: {type(e).__name__}: {e}"}
             rc_close = m.CloseCurrentDocument(QUERYSAVE_NO)
-            return {"path": str(path), "saved": path.exists(),
+            return {"path": str(path), "saved": path.exists(), "image": stats, "imaging": imaging,
                     "rc_capture": rc_capture, "rc_save": rc_save, "rc_close": rc_close}
         out = _ui.call(on_main_thread, timeout_s=300)
     if out.get("saved") is False:
         out["error"] = "NIS did not save the file"
+    if (w := signal_warnings(out.get("image", {}))):
+        out["warnings"] = w
+    return out
+
+
+def imaging_status(args: dict) -> dict:
+    if _nd_run is not None:
+        return {"error": "an ND run holds NIS until it ends; status reports the run", "nd_running": True}
+    with nis().held() as m:
+        out = m.imaging()
+    out["estop_engaged"] = estop_engaged()
+    out["note"] = ("The camera and live view are not readable from here yet; NIS shows them. "
+                   "light_path port numbers are NIS's; port_name is filled in from LIGHT_PATH_NAMES.")
     return out
 
 
@@ -636,9 +773,17 @@ TOOLS = [
       "description": f"Move the XY stage by (dx_um, dy_um) microns from where it is, at most "
                      f"{MAX_STEP_UM:g} um per axis, and never out of the safe XY area (status reports "
                      "it as xy_limits_um). Returns the position before and after; treat after_um as "
-                     "the truth. Z cannot be moved.",
+                     "the truth. Z does not move (see focus_down).",
       "inputSchema": _schema(dx_um=_NUMBER, dy_um=_NUMBER)},
      move_relative),
+    ({"name": "focus_down",
+      "description": f"Lower the objective by down_um microns (at most {MAX_Z_DOWN_UM:g}), i.e. move it "
+                     "AWAY from the sample on this inverted microscope. It cannot raise the objective: "
+                     "a person raises it close to the dish while watching the gap. To focus, lower in "
+                     "steps and capture after each one, keeping the sharpest; focus is found by moving "
+                     "away. Returns Z before and after.",
+      "inputSchema": _schema(down_um=_NUMBER)},
+     focus_down),
     ({"name": "change_objective",
       "description": "Turn the nosepiece to an objective and switch NIS's calibration to it. Only the 4x "
                      "and 10x objectives are allowed. Give the objective's name exactly as on the "
@@ -651,10 +796,20 @@ TOOLS = [
                      "here: set it in NIS before capture.",
       "inputSchema": _schema()},
      list_optical_configs),
+    ({"name": "imaging_status",
+      "description": "Read-only: what decides how the next image is taken - the active optical "
+                     "configuration (its objective, camera and microscope parts), the light path port "
+                     "(camera or eyepieces) and whether each shutter is open. Check it before capture.",
+      "inputSchema": _schema()},
+     imaging_status),
     ({"name": "capture",
       "description": "Capture one image with the optical configuration active in NIS and save it as ND2 "
                      "in the capture folder. 'filename' is a plain name such as \"aml18_check\", no "
-                     "folders; .nd2 is added. An existing file is never overwritten. Returns the path.",
+                     "folders; .nd2 is added. An existing file is never overwritten. Returns the path, "
+                     "the imaging state it was taken with, and the image's size and per-channel "
+                     "intensity (min/max/mean/percentiles/saturation, from a sample of pixels). "
+                     "'warnings' flags a nearly blank or saturated image: a saved file is not "
+                     "necessarily a useful image, but a real sample can also be dark.",
       "inputSchema": _schema(filename=_STRING)},
      capture),
     ({"name": "list_experiments",

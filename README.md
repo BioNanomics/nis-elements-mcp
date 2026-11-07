@@ -10,10 +10,12 @@ the PC besides NIS: the server uses only the standard library.
 |---|---|
 | `echo` | returns the text: checks that the server answers |
 | `status` | stage XY and Z, objective, nosepiece, ND run state, e-stop state, safe XY area (read-only) |
-| `move_relative` | XY move from where the stage is, at most 1000 um per axis, never out of the safe XY area; Z never moves |
+| `move_relative` | XY move from where the stage is, at most 1000 um per axis, never out of the safe XY area |
+| `focus_down` | lowers the objective (away from the sample) by at most 200 um; nothing raises it: a person does, watching the gap |
 | `change_objective` | turns the nosepiece and switches NIS's calibration; 4x and 10x only |
 | `list_optical_configs` | the optical configurations defined in NIS (read-only; select one in NIS) |
-| `capture` | one image with the active optical configuration, saved as ND2 in `~/nis-mcp/captures`, by plain file name, never overwriting |
+| `imaging_status` | the active optical configuration (objective, camera and microscope parts), the light path port and each shutter's state (read-only) |
+| `capture` | one image with the active optical configuration, saved as ND2 in `~/nis-mcp/captures`, by plain file name, never overwriting. Reports the imaging state it used and each channel's intensity (min/max/mean/percentiles/saturation, from a 64 x 64 sample of pixels), with a warning for a nearly blank or saturated image |
 | `list_experiments` | the ND experiments saved in NIS, with each one's loops, time-lapse length (or "single pass"), interval/duration/frames, Z steps and output file (read-only) |
 | `run_experiment` | runs an ND experiment saved in NIS's ND Acquisition window, by name; a name that is not saved, or a time-lapse over 30 min, is refused |
 | `finish_experiment` | ends the running ND experiment after its current loop |
@@ -36,6 +38,8 @@ The limits are constants at the top of `NISMCPServer.py`: edit and save.
 | `MAX_ND_RUN_S` | the longest time-lapse `run_experiment` starts (30 min); start longer runs in NIS |
 | `ALLOWED_EXPERIMENTS` | if it lists names, only those ND experiments run |
 | `CAPTURE_DIR` | where captures go (`~/nis-mcp/captures`) |
+| `LOW_SIGNAL_FRACTION`, `SATURATED_FRACTION` | when capture warns (1% of full scale; 1% of pixels saturated) |
+| `LIGHT_PATH_NAMES` | names for the light path port numbers `imaging_status` reports; fill in on the scope |
 
 Every tool call is logged as one JSON line in `~/nis-mcp/log.jsonl`: time,
 tool, arguments, result, refusals included.
