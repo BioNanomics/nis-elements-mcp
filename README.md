@@ -14,7 +14,7 @@ the PC besides NIS: the server uses only the standard library.
 | `focus_down` | lowers the objective (away from the sample) by at most 200 um; nothing raises it: a person does, watching the gap |
 | `change_objective` | turns the nosepiece and switches NIS's calibration; 4x and 10x only |
 | `list_optical_configs` | the optical configurations defined in NIS (read-only; select one in NIS) |
-| `imaging_status` | the active optical configuration (objective, camera and microscope parts), the light path port and each shutter's state (read-only) |
+| `imaging_status` | active saved optical configuration names and their raw return value, separate objective/camera name readbacks and diagnostic errors, light path and shutter states (read-only) |
 | `capture` | one image with the active optical configuration, saved as ND2 in `~/nis-mcp/captures`, by plain file name, never overwriting. Returns promptly with a capture ID and queued/running state for a slow capture; fast captures can return their completed result. Per-phase timings are included. `include_stats=true` opts into sampled intensity statistics; they are skipped by default |
 | `capture_status` | cached progress/result for the current or last capture, optionally checked against `capture_id`; never enters NIS or waits for its UI |
 | `list_experiments` | the ND experiments saved in NIS, with each one's loops, time-lapse length (or "single pass"), interval/duration/frames, Z steps and output file (read-only) |
@@ -44,6 +44,91 @@ The limits are constants at the top of `NISMCPServer.py`: edit and save.
 
 Every tool call is logged as one JSON line in `~/nis-mcp/log.jsonl`: time,
 tool, arguments, result, refusals included.
+
+## Imaging diagnostics (0.8.3)
+
+`imaging_status` retains the existing `optical_config`, `light_path`,
+`shutters` and `estop_engaged` fields. It adds these read-only diagnostics:
+
+| Field | Meaning |
+|---|---|
+| `objective` | Current objective name from `GetCurrentObjName`; `null` if empty |
+| `objective_rc` | Raw return value from that name query; `null` if the call raises an exception |
+| `camera_name` | Currently selected camera name from `GetCurrentCameraName`; `null` if empty or unavailable |
+| `camera_name_rc` | Raw return value from that camera query; `null` if the call raises an exception |
+| `optical_config_rc` | Raw return value from `GetSelectedOptConf`; `null` if the call raises an exception |
+| `diagnostic_errors` | Present when a name query raises an exception; maps function names to error details. Other readbacks remain available |
+
+`optical_config.objective`, `.camera`, and `.microscope` are **active saved
+configuration names** associated with those settings categories. They are
+not hardware names. Blank configuration names do not mean there is no
+objective or camera. The actual objective and selected camera name are
+queried separately. A camera name does not prove that it is connected,
+ready, or delivering frames. Live-view state is not queried.
+
+The return values are exposed without assigning undocumented success or
+failure meanings; for example, a zero return is not automatically treated
+as failure. A missing camera-name DLL export is optional and does not
+disable existing tools. The installed NIS 6.20 macro reference documents
+`GetSelectedOptConf` under OpticalConfiguration and `GetCurrentCameraName`
+under Camera - Other.
+
+Version 0.8.3 binds the camera getter from `g5_new_ml.dll`, where the
+installed x64 DLL exports `?GetCurrentCameraName@@YAHPEA_W@Z` (C++ linkage
+for `int GetCurrentCameraName(wchar_t*)`). The binding uses a writable
+Unicode buffer and exposes the raw integer return value. It is resolved
+on the first camera-name read and cached; a missing DLL/export is reported
+through `diagnostic_errors` without disabling other imaging readbacks.
+It does not call the unverified `GetCurrentCameraName_Impl` export.
+
+These diagnostics do not select configurations, open shutters, move
+hardware, start live imaging, capture images, or run experiments. They are
+also included in capture imaging metadata because capture uses the same
+readback helper. During an active capture, `imaging_status` continues to
+return cached capture progress rather than enter NIS.
+
+Mock verification includes separate hardware/configuration names, blank
+configuration and camera names, raw return values of 0/1/-4, and isolated
+read exceptions for each query. Additional binding tests use a fake DLL
+loader to verify the exact export, signature, lazy resolution, caching,
+and missing DLL/export errors. The full mock-only suite passed 59 tests
+with the actual-settings-file test deselected before repo integration.
+
+The earlier 0.8.2 read-only live check reported objective
+`PLAN APO \u03bbD 4x OFN25`, `objective_rc: 0`, blank configuration names,
+and `optical_config_rc: 0`. `camera_name` and `camera_name_rc` were `null`,
+with `diagnostic_errors.GetCurrentCameraName` reporting
+`AttributeError: function 'GetCurrentCameraName' not found`. Thus the
+installed macro reference documents the function, but `g5_regprocs.dll`
+does not export it. Offline export inspection subsequently located it in
+`g5_new_ml.dll`, leading to the 0.8.3 binding above. The original failure
+was an API binding issue, not evidence that a camera
+is disconnected. No fallback function, camera selection, capture, or
+experiment was invoked.
+
+The 0.8.3 read-only check on 2026-11-17 returned camera name
+`Nikon_Confocal_Ax`, `camera_name_rc: 0`, objective
+`PLAN APO \u03bbD 4x OFN25`, and `objective_rc: 0`, with no
+`diagnostic_errors`. Saved configuration names remained blank with
+`optical_config_rc: 0`; all reported shutters remained closed. This
+confirms the camera-name binding works for the currently selected NIS
+device, not that a brightfield camera is connected or delivering an image.
+No camera selection, capture, or experiment was started.
+
+The operator subsequently confirmed that **no optical configuration button
+is highlighted in NIS**. Together with the read-only API returning blank
+active configuration names while 14 saved configurations remain listed,
+this supports the interpretation that no saved configuration is selected.
+Blank names therefore **appear expected in the observed state**, rather
+than establishing a reporting fault. This remains an interpretation of
+the API output and the operator's observation, not a selection test.
+
+**Selection verification is pending.** Applying a known configuration and
+checking whether its names appear in `imaging_status` would change NIS
+settings, so it was not performed. The configuration's included settings
+and NIS's behavior when configuration settings change have not yet been
+confirmed. No settings were changed and no capture or experiment was
+started for this investigation.
 
 ## Capture progress (0.8.1)
 

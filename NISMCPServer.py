@@ -60,7 +60,7 @@ from pathlib import Path
 
 HOST = "127.0.0.1"
 PORT = int(os.environ.get("NIS_MCP_PORT", "").strip() or 8767)
-NAME, VERSION = "nis-mcp-server", "0.8.2"
+NAME, VERSION = "nis-mcp-server", "0.8.3"
 WATCH_S = 1.0                   # how often to look for a changed file
 PROTOCOL_VERSIONS = ("2025-11-25", "2025-06-18", "2025-03-26")   # newest first
 
@@ -146,8 +146,16 @@ class NIS:
         "GetPixelValueEx": [ct.c_int, ct.c_int, ct.c_int, ct.c_int, ct.POINTER(ct.c_int)],
     }
 
+    # Installed x64 g5_new_ml.dll exports the documented camera getter using
+    # C++ linkage: int __cdecl GetCurrentCameraName(wchar_t*). Do not call the
+    # similarly named _Impl export: its interface has not been verified.
+    CAMERA_NAME_EXPORT = "?GetCurrentCameraName@@YAHPEA_W@Z"
+
     def __init__(self, dll=None):
         self.lock = threading.Lock()
+        self._native = dll is None
+        self._camera_name_dll = None
+        self._camera_name_fn = None
         if dll is None:
             dll = ct.cdll.g5_regprocs   # only loads inside nis_ar.exe
             for name, args in self.SIGNATURES.items():
@@ -155,6 +163,15 @@ class NIS:
         self.dll = dll
 
     def __getattr__(self, name):
+        if name == "GetCurrentCameraName" and self._native:
+            # Resolve lazily during a read under held(), not at server startup.
+            # Missing DLL/exports surface as diagnostic_errors in imaging().
+            if self._camera_name_fn is None:
+                self._camera_name_dll = ct.cdll.g5_new_ml
+                fn = getattr(self._camera_name_dll, self.CAMERA_NAME_EXPORT)
+                fn.argtypes, fn.restype = [ct.c_wchar_p], ct.c_int
+                self._camera_name_fn = fn
+            return self._camera_name_fn
         return getattr(self.dll, name)
 
     @contextlib.contextmanager

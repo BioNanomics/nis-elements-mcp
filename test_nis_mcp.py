@@ -551,6 +551,70 @@ def test_imaging_diagnostic_read_error_keeps_other_readbacks(scope, function):
         assert out["objective"] == "Plan Fluor 4x"
 
 
+def test_camera_name_uses_new_ml_export_and_caches_binding(scope, monkeypatch):
+    resolved, loaded, calls = [], [], []
+
+    class Getter:
+        def __call__(self, name):
+            calls.append("camera name")
+            name.value = "Mock selected camera from new_ml"
+            return 0
+
+    getter = Getter()
+
+    class CameraDLL:
+        def __getattr__(self, name):
+            resolved.append(name)
+            assert name == "?GetCurrentCameraName@@YAHPEA_W@Z"
+            return getter
+
+    class MockLoader:
+        def __getattr__(self, name):
+            loaded.append(name)
+            assert name == "g5_new_ml"  # no regprocs lookup or unverified _Impl call
+            return CameraDLL()
+
+    # Exercise the production resolution branch with an entirely fake loader.
+    # NIS itself was constructed with FakeScope; no native library is loaded.
+    monkeypatch.setattr(server.ct, "cdll", MockLoader())
+    server._nis._native = True
+    assert loaded == []  # optional binding is lazy
+    for _ in range(2):
+        out, err = tool("imaging_status")
+        assert not err and out["camera_name"] == "Mock selected camera from new_ml"
+        assert out["camera_name_rc"] == 0 and "diagnostic_errors" not in out
+        assert out["objective"] == "Plan Fluor 4x"
+    assert loaded == ["g5_new_ml"] and resolved == [server.NIS.CAMERA_NAME_EXPORT]
+    assert getter.argtypes == [server.ct.c_wchar_p] and getter.restype is server.ct.c_int
+    assert calls == ["camera name", "camera name"] and scope.calls == []
+
+
+@pytest.mark.parametrize("missing", ["dll", "export"])
+def test_camera_name_new_ml_unavailable_keeps_other_diagnostics(scope, monkeypatch, missing):
+    class MissingExport:
+        def __getattr__(self, name):
+            assert name == server.NIS.CAMERA_NAME_EXPORT
+            raise AttributeError("mock camera-name export missing")
+
+    class MockLoader:
+        def __getattr__(self, name):
+            assert name == "g5_new_ml"
+            if missing == "dll":
+                raise OSError("mock camera DLL unavailable")
+            return MissingExport()
+
+    monkeypatch.setattr(server.ct, "cdll", MockLoader())
+    server._nis._native = True
+    out, err = tool("imaging_status")
+    assert not err and out["camera_name"] is None and out["camera_name_rc"] is None
+    expected = ("OSError: mock camera DLL unavailable" if missing == "dll" else
+                "AttributeError: mock camera-name export missing")
+    assert out["diagnostic_errors"] == {"GetCurrentCameraName": expected}
+    assert out["objective"] == "Plan Fluor 4x" and out["optical_config_rc"] == 1
+    assert out["light_path"]["port"] == 2 and out["shutters"] == {"EPI": "closed", "DIA": "open"}
+    assert scope.calls == []
+
+
 def test_capture_reports_intensity_and_warns_on_low_signal(scope, main_thread):
     out, err = tool("capture", filename="stats", include_stats=True)
     assert not err and out["saved"]
