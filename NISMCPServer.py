@@ -60,7 +60,7 @@ from pathlib import Path
 
 HOST = "127.0.0.1"
 PORT = int(os.environ.get("NIS_MCP_PORT", "").strip() or 8767)
-NAME, VERSION = "nis-mcp-server", "0.8.1"
+NAME, VERSION = "nis-mcp-server", "0.8.2"
 WATCH_S = 1.0                   # how often to look for a changed file
 PROTOCOL_VERSIONS = ("2025-11-25", "2025-06-18", "2025-03-26")   # newest first
 
@@ -192,8 +192,27 @@ class NIS:
         """What decides how an image is taken: the active optical configurations,
         the light path port and the shutters (read-only)."""
         obj, cam, mic = (ct.create_unicode_buffer(256) for _ in range(3))
-        self.GetSelectedOptConf(obj, cam, mic, 255)
-        out = {"optical_config": {"objective": obj.value, "camera": cam.value, "microscope": mic.value}}
+        objective, camera = (ct.create_unicode_buffer(1024) for _ in range(2))
+        errors = {}
+
+        def read_name(function, *args):
+            try:
+                return getattr(self, function)(*args)
+            except Exception as e:
+                errors[function] = f"{type(e).__name__}: {e}"
+                return None
+
+        config_rc = read_name("GetSelectedOptConf", obj, cam, mic, 255)
+        objective_rc = read_name("GetCurrentObjName", objective)
+        camera_rc = read_name("GetCurrentCameraName", camera)
+        # Keep the original fields: these are saved configuration names, not
+        # hardware identities. Raw return values have no assumed success code.
+        out = {"optical_config": {"objective": obj.value, "camera": cam.value, "microscope": mic.value},
+               "optical_config_rc": config_rc,
+               "objective": objective.value or None, "objective_rc": objective_rc,
+               "camera_name": camera.value or None, "camera_name_rc": camera_rc}
+        if errors:
+            out["diagnostic_errors"] = errors
         if self.Stg_IsLightPathPresent() == 1:
             port = self.Stg_GetLightPathPosition()
             out["light_path"] = {"port": port, "port_name": LIGHT_PATH_NAMES.get(port),
@@ -694,7 +713,11 @@ def imaging_status(args: dict) -> dict:
     with nis().held() as m:
         out = m.imaging()
     out["estop_engaged"] = estop_engaged()
-    out["note"] = ("The camera and live view are not readable from here yet; NIS shows them. "
+    out["note"] = ("optical_config contains active saved configuration names, not hardware names. "
+                   "objective and camera_name are separate NIS name readbacks; blank names are null "
+                   "and do not establish whether hardware is connected or ready. Return codes are raw, "
+                   "without assumed success semantics; diagnostic_errors reports read exceptions. "
+                   "Live-view state is not read. "
                    "light_path port numbers are NIS's; port_name is filled in from LIGHT_PATH_NAMES.")
     return out
 
@@ -962,9 +985,10 @@ TOOLS = [
       "inputSchema": _schema()},
      list_optical_configs),
     ({"name": "imaging_status",
-      "description": "Read-only: what decides how the next image is taken - the active optical "
-                     "configuration (its objective, camera and microscope parts), the light path port "
-                     "(camera or eyepieces) and whether each shutter is open. Check it before capture.",
+      "description": "Read-only: active saved optical configuration names and their raw return value, "
+                     "separate objective and camera name readbacks with raw return values/read errors, "
+                     "the light path port and shutter states. Names do not prove hardware readiness; "
+                     "live-view state is not read. Check it before capture.",
       "inputSchema": _schema()},
      imaging_status),
     ({"name": "capture",

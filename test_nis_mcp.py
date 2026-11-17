@@ -278,6 +278,10 @@ class FakeScope:
         obj.value, cam.value, mic.value = "", "Nikon AX:DIC_10x", "Nikon AX:DIC_10x"
         return 1
 
+    def GetCurrentCameraName(self, name):
+        name.value = "Mock camera"
+        return 0
+
     def Stg_IsLightPathPresent(self):
         return 1
 
@@ -498,8 +502,53 @@ def test_imaging_status(scope, monkeypatch):
     out, err = tool("imaging_status")
     assert not err
     assert out["optical_config"]["camera"] == "Nikon AX:DIC_10x"
+    assert out["optical_config_rc"] == 1
+    assert out["objective"] == "Plan Fluor 4x"
+    assert out["camera_name"] == "Mock camera" and out["camera_name_rc"] == 0
+    assert "diagnostic_errors" not in out
     assert out["light_path"] == {"port": 2, "port_name": "L100", "ports": 4}
     assert out["shutters"] == {"EPI": "closed", "DIA": "open"} and out["estop_engaged"] is False
+    assert scope.calls == []  # no acquisition, device selection, or movement
+
+
+@pytest.mark.parametrize("config_rc", [0, 1, -4])
+def test_imaging_diagnostics_separate_hardware_names_from_blank_configs(scope, config_rc):
+    def blank_configs(obj, cam, mic, n):
+        return config_rc
+
+    scope.GetSelectedOptConf = blank_configs
+    out, err = tool("imaging_status")
+    assert not err and out["optical_config"] == {"objective": "", "camera": "", "microscope": ""}
+    assert out["optical_config_rc"] == config_rc  # no invented return-code interpretation
+    assert out["objective"] == "Plan Fluor 4x" and out["camera_name"] == "Mock camera"
+    assert scope.calls == []
+
+
+def test_imaging_diagnostics_empty_camera_is_unknown_not_disconnected(scope):
+    scope.GetCurrentCameraName = lambda name: -4
+    out, err = tool("imaging_status")
+    assert not err and out["camera_name"] is None and out["camera_name_rc"] == -4
+    assert out["objective"] == "Plan Fluor 4x" and scope.calls == []
+
+
+@pytest.mark.parametrize("function", ["GetSelectedOptConf", "GetCurrentObjName", "GetCurrentCameraName"])
+def test_imaging_diagnostic_read_error_keeps_other_readbacks(scope, function):
+    def unavailable(*args):
+        raise AttributeError("mock diagnostic unavailable")
+
+    setattr(scope, function, unavailable)
+    out, err = tool("imaging_status")
+    assert not err and out["diagnostic_errors"] == {function: "AttributeError: mock diagnostic unavailable"}
+    assert out["shutters"] == {"EPI": "closed", "DIA": "open"}
+    assert out["light_path"]["port"] == 2 and scope.calls == []
+    if function == "GetSelectedOptConf":
+        assert out["optical_config_rc"] is None and out["camera_name"] == "Mock camera"
+    elif function == "GetCurrentObjName":
+        assert out["objective"] is None and out["objective_rc"] is None
+        assert out["camera_name"] == "Mock camera"
+    else:
+        assert out["camera_name"] is None and out["camera_name_rc"] is None
+        assert out["objective"] == "Plan Fluor 4x"
 
 
 def test_capture_reports_intensity_and_warns_on_low_signal(scope, main_thread):
