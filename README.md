@@ -194,7 +194,16 @@ Saved console log:
 D:\QurratulAin_ConfocalOrchestratorProject\Confocal_MCP\nis-mcp-server\test-reports\mock-20261117-135615-b5a0e12c\pytest.log
 ```
 
-The last full mock-only run passed **59 tests**, with **1 deselected**
+After the 0.8.4 E-stop fixes, the full isolated mock-only run passed
+**63 tests**, with **1 deselected**, and exit code **0**. Its saved report
+and console log are under:
+
+```text
+C:\Users\AX Confocal\Documents\Codex\2026-10-30\ho\outputs\estop-fix-mock-reports\mock-20261117-141945-ea099fde\results.xml
+C:\Users\AX Confocal\Documents\Codex\2026-10-30\ho\outputs\estop-fix-mock-reports\mock-20261117-141945-ea099fde\pytest.log
+```
+
+The 1 test remains deselected
 because it reads this PC's actual saved NIS experiment settings. Successful
 and failed captures over isolated HTTP both verified progress, phase
 timings, terminal results and logs. After the XY limit update, the 3
@@ -209,6 +218,33 @@ rerun the full suite and save reports.
 | Imaging-state reporting | Camera-name binding via `g5_new_ml.dll` passed a live read-only check, returning `Nikon_Confocal_Ax`. Light-path port-name mapping and live-view reporting remain pending |
 | ND run and finish behavior | Successful runs, `finish_experiment`, busy-state reporting and actual timing remain unvalidated in this session. Do not run automatically as part of safety tests |
 | Geometry and accuracy | Confirm clearance for the current holder/sample/objective and validate calibration, repeatability and image displacement as needed; endpoint readings and software readbacks alone do not establish these |
+
+## E-stop preflight checks (0.8.4)
+
+`focus_down` rechecks the E-stop after acquiring the NIS lock and reading
+the starting Z, immediately before issuing `StgMoveZ`. This prevents a
+pending focus request from proceeding after a stop engaged during its
+lock wait or position read.
+
+Capture rechecks the E-stop immediately before `Capture()`, after imaging
+reads and acquisition-phase logging. A stop during either preflight step
+produces a terminal `cancelled` result without calling capture, save, or
+close. The phase timing is finalized before that result is stored, so
+`capture_status` and the log retain consistent cancellation timings.
+An `acquire` phase event can therefore exist even when E-stop prevented
+the actual native acquisition call.
+
+Four new mock regression cases cover focus lock-wait and position-read
+stops, plus capture imaging-read and acquisition-phase-start stops. All
+four failed against 0.8.3 and passed with the fix. They verify no native
+mutation, lock release, and, for capture, cached cancellation results,
+phase timing logs, and absence of an output file.
+
+CI now runs both `test_nis_mcp.py` and `test_capture_mock_http.py`, excluding
+the actual-settings-file test, on the existing Windows/Linux and Python
+3.11/3.13 matrix. Local mock validation does not establish remote CI status
+or hardware behavior. These checks do not cancel a native operation that
+has already started; a physical emergency stop remains separate.
 
 ## Imaging diagnostics (0.8.3)
 
@@ -452,7 +488,7 @@ $LASTEXITCODE
 ```
 
 Exit code `0` means the tests passed; a nonzero code means a failure or
-setup problem. The last verified full run reported **59 passed, 1
+setup problem. The last verified full run reported **63 passed, 1
 deselected**; the deselected test reads actual NIS experiment settings.
 If optional MCP SDK dependencies are absent, that client test is skipped.
 

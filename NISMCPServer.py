@@ -60,7 +60,7 @@ from pathlib import Path
 
 HOST = "127.0.0.1"
 PORT = int(os.environ.get("NIS_MCP_PORT", "").strip() or 8767)
-NAME, VERSION = "nis-mcp-server", "0.8.3"
+NAME, VERSION = "nis-mcp-server", "0.8.4"
 WATCH_S = 1.0                   # how often to look for a changed file
 PROTOCOL_VERSIONS = ("2025-11-25", "2025-06-18", "2025-03-26")   # newest first
 
@@ -556,6 +556,10 @@ def focus_down(args: dict) -> dict:
         if before - down < Z_MIN_UM:
             return {"error": f"Z would go to {before - down:g} um, below Z_MIN_UM {Z_MIN_UM:g}",
                     "z_um": before}
+        # The stop may have been engaged while waiting for held() or reading Z.
+        # Recheck at the native-command boundary, after all blocking preflight.
+        if (r := _stopped("focus")):
+            return r
         rc = m.StgMoveZ(-down, MOVE_RELATIVE)
         after = m.position()[2]
     out = {"z_before_um": before, "z_after_um": after, "rc": rc}
@@ -679,7 +683,14 @@ def capture(args: dict) -> dict:
                         raise RuntimeError("NIS is already acquiring an ND experiment")
                     out["imaging"] = m.imaging()
                 with _capture_phase(job, "acquire"):
-                    out["rc_capture"] = m.Capture()
+                    # Imaging reads and phase logging can block. A stop raised
+                    # there must prevent acquisition, not just later retries.
+                    stopped_before_acquire = _stopped("capture")
+                    if stopped_before_acquire is None:
+                        out["rc_capture"] = m.Capture()
+                if stopped_before_acquire is not None:
+                    # Finalize after the phase exits so its timing is retained.
+                    return _capture_finish(job, {**out, **stopped_before_acquire}, "cancelled")
                 # E-stop blocks new acquisitions, not preservation of an image
                 # already acquired. Do not promise cancellation of native Capture().
                 with _capture_phase(job, "save"):

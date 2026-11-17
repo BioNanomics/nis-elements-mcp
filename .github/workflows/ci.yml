@@ -20,4 +20,4 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
       - run: pip install pytest "mcp>=2.0,<3"
-      - run: python -m pytest -v test_nis_mcp.py
+      - run: python -m pytest -v test_nis_mcp.py test_capture_mock_http.py -k "not reads_this_pcs_saved_experiments"

@@ -797,6 +797,46 @@ def test_capture_failure_logs_exact_phase_and_does_not_save_or_close(scope, main
     assert tool("capture_status")[0]["result"] == out
 
 
+@pytest.mark.parametrize("stop_during", ["imaging_read", "acquire_phase_start"])
+def test_capture_rechecks_estop_immediately_before_acquisition(scope, main_thread, monkeypatch, stop_during):
+    if stop_during == "imaging_read":
+        original = server.NIS.imaging
+
+        def imaging_then_stop(self):
+            result = original(self)
+            server.estop({"action": "engage", "reason": "mock pre-acquisition stop"})
+            return result
+
+        monkeypatch.setattr(server.NIS, "imaging", imaging_then_stop)
+    else:
+        original = server._capture_event
+
+        def event_then_stop(job, event, **fields):
+            original(job, event, **fields)
+            if event == "capture_phase_started" and fields.get("phase") == "acquire":
+                server.estop({"action": "engage", "reason": "mock acquisition-phase stop"})
+
+        monkeypatch.setattr(server, "_capture_event", event_then_stop)
+
+    out, err = tool("capture", filename="stopped_before_acquire")
+    assert err and out["state"] == "cancelled" and out["estop_engaged"]
+    assert not out["saved"] and "e-stop" in out["error"]
+    assert scope.calls == []  # no Capture, save, close, or movement
+    assert not server.Path(out["path"]).exists()
+    assert not server._nis.lock.locked() and server.ESTOP.exists()
+    progress, query_error = tool("capture_status", capture_id=out["capture_id"])
+    assert not query_error and not progress["capture_in_progress"]
+    assert progress["state"] == "cancelled" and progress["result"] == out
+    entries = [json.loads(line) for line in server.LOG_FILE.read_text().splitlines()]
+    terminal = [entry for entry in entries if entry.get("event") == "capture_finished"]
+    assert len(terminal) == 1 and terminal[0]["state"] == "cancelled"
+    acquire_finished = [entry for entry in entries if entry.get("event") == "capture_phase_finished"
+                        and entry.get("phase") == "acquire"]
+    assert len(acquire_finished) == 1
+    assert acquire_finished[0]["took_s"] == out["timings_s"]["acquire"]
+    assert not any(entry.get("phase") in ("save", "statistics", "close") for entry in entries)
+
+
 @pytest.mark.parametrize("empty_file", [False, True])
 def test_failed_or_empty_save_leaves_document_open(scope, main_thread, empty_file):
     def no_image_saved(path, *args):
@@ -1030,3 +1070,47 @@ def test_focus_down_reports_a_z_drive_that_did_not_move(scope):
     scope.StgMoveZ = lambda dz, rel: 1                           # accepts, never moves
     out, err = tool("focus_down", down_um=10)
     assert err and "did not go down" in out["error"]
+
+
+def test_focus_down_rechecks_estop_after_waiting_for_lock(scope, monkeypatch):
+    lock = server._nis.lock
+    initial_check = threading.Event()
+    original = server._stopped
+
+    def observed_check(operation):
+        result = original(operation)
+        if operation == "focus":
+            initial_check.set()
+        return result
+
+    monkeypatch.setattr(server, "_stopped", observed_check)
+    results = []
+    worker = threading.Thread(target=lambda: results.append(tool("focus_down", down_um=10)), daemon=True)
+    lock.acquire()
+    try:
+        worker.start()
+        assert initial_check.wait(2), "focus did not reach its initial E-stop check"
+        server.estop({"action": "engage", "reason": "mock focus lock-wait stop"})
+    finally:
+        lock.release()
+        worker.join(2)
+    assert not worker.is_alive() and len(results) == 1
+    out, err = results[0]
+    assert err and out["estop_engaged"] and "e-stop" in out["error"]
+    assert scope.calls == [] and scope.z == 4619.0
+    assert not lock.locked() and server.ESTOP.exists()
+
+
+def test_focus_down_rechecks_estop_after_position_read(scope, monkeypatch):
+    original = server.NIS.position
+
+    def position_then_stop(self):
+        result = original(self)
+        server.estop({"action": "engage", "reason": "mock focus position-read stop"})
+        return result
+
+    monkeypatch.setattr(server.NIS, "position", position_then_stop)
+    out, err = tool("focus_down", down_um=10)
+    assert err and out["estop_engaged"] and "e-stop" in out["error"]
+    assert scope.calls == [] and scope.z == 4619.0
+    assert not server._nis.lock.locked() and server.ESTOP.exists()
