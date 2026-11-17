@@ -20,6 +20,15 @@ import NISMCPServer as server
 def no_real_log(monkeypatch, tmp_path):
     """Tests never write to the scope's own log."""
     monkeypatch.setattr(server, "LOG_FILE", tmp_path / "log.jsonl")
+    monkeypatch.setattr(server, "_capture_job", None)
+    native_init = server.NIS.__init__
+
+    def mock_only_init(self, dll=None):
+        if dll is None:
+            raise AssertionError("Tests must never connect to real NIS")
+        native_init(self, dll)
+
+    monkeypatch.setattr(server.NIS, "__init__", mock_only_init)
 
 
 @pytest.fixture
@@ -47,8 +56,9 @@ def test_handshake_list_and_echo(url):
     assert "Never answer from what an earlier call returned" in out["result"]["instructions"]
     assert post(url + "/mcp", {"jsonrpc": "2.0", "method": "notifications/initialized"})[0] == 202
     tools = post(url + "/mcp", {"jsonrpc": "2.0", "id": 2, "method": "tools/list"})[1]["result"]["tools"]
-    assert [t["name"] for t in tools] == ["echo", "status", "move_relative", "change_objective",
-                                          "list_optical_configs", "capture", "list_experiments",
+    assert [t["name"] for t in tools] == ["echo", "status", "move_relative", "focus_down", "change_objective",
+                                          "list_optical_configs", "imaging_status", "capture", "capture_status",
+                                          "list_experiments",
                                           "run_experiment",
                                           "finish_experiment", "estop"]
     out = post(url + "/mcp", {"jsonrpc": "2.0", "id": 3, "method": "tools/call",
@@ -104,6 +114,8 @@ def test_reloads_on_save_and_keeps_serving_broken_code(tmp_path, monkeypatch):
     spec = importlib.util.spec_from_file_location("NISMCPServer", path)
     first = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(first)                      # what the job's loader does
+    # No real Windows timer or NIS connection, even on the microscope PC.
+    monkeypatch.setattr(first.MainThread, "install", lambda self: setattr(self, "installed", True))
     first.run(None, None, None, None)
 
     def version():
@@ -122,7 +134,14 @@ def test_reloads_on_save_and_keeps_serving_broken_code(tmp_path, monkeypatch):
 
     try:
         assert version() == server.VERSION
+        now = time.monotonic()
+        first._capture_job = {"capture_id": "mock-running", "state": "running", "phase": "acquire",
+                              "path": "mock.nd2", "timings_s": {}, "started_mono": now,
+                              "phase_started_mono": now, "queue_deadline": now + 30}
         path.write_text(source.replace(f'"{server.VERSION}"', '"9.9.9"'), encoding="utf-8")
+        time.sleep(0.8)
+        assert version() == server.VERSION             # active capture ownership cannot be reloaded away
+        first._capture_job = None
         assert wait_for("9.9.9")
         path.write_text(source + "\nthis is not python\n", encoding="utf-8")
         time.sleep(1.5)
@@ -176,6 +195,11 @@ class FakeScope:
         pz._obj.value = self.z
         return 1
 
+    def StgMoveZ(self, dz, relative):
+        assert relative == server.MOVE_RELATIVE
+        self.z += dz
+        return self._record("z", dz)
+
     def StgMoveXY(self, dx, dy, relative):
         assert relative == server.MOVE_RELATIVE
         self.x += dx
@@ -194,7 +218,8 @@ class FakeScope:
 
     def ImageSaveAs(self, path, kind, compression):
         assert kind == server.ND2_ALL_LAYERS
-        open(path, "wb").close()
+        with open(path, "wb") as f:
+            f.write(b"mock ND2 data")
         return self._record("save", path)
 
     def CloseCurrentDocument(self, query):
@@ -242,6 +267,51 @@ class FakeScope:
     def ChangeObjective(self, name):
         self.calls.append(("calibrate", name))
         self.cal = name
+        return 1
+
+    # imaging state and the current image
+    light_path, shutters = 2, {"EPI": 0, "DIA": 1}
+    image = (40, 30, 12, 2)                 # width, height, bits, channels
+    pixel = staticmethod(lambda r, c, k: 5 * k + r // 10)   # nearly blank, as the dark capture on 2026-11-05
+
+    def GetSelectedOptConf(self, obj, cam, mic, n):
+        obj.value, cam.value, mic.value = "", "Nikon AX:DIC_10x", "Nikon AX:DIC_10x"
+        return 1
+
+    def GetCurrentCameraName(self, name):
+        name.value = "Mock camera"
+        return 0
+
+    def Stg_IsLightPathPresent(self):
+        return 1
+
+    def Stg_GetLightPathPosition(self):
+        return self.light_path
+
+    def Stg_GetLightPathPositions(self):
+        return 4
+
+    def Stg_GetShutterCount(self):
+        return len(self.shutters)
+
+    def Stg_GetShutterName(self, i, buf, n):
+        buf.value = list(self.shutters)[i]
+        return 1
+
+    def Stg_GetShutterStateEx(self, name):
+        return self.shutters[name]
+
+    def Get_ImageInfo(self, name, w, h, bits, planes):
+        assert name == ""                   # the current image
+        if self.image is None:
+            return -1
+        w._obj.value, h._obj.value, bits._obj.value, planes._obj.value = self.image
+        return 1
+
+    def GetPixelValueEx(self, doc, undo, r, c, comp):
+        assert (doc, undo) == (-1, 0) and 0 <= r < self.image[1] and 0 <= c < self.image[0]
+        for k in range(self.image[3]):
+            comp[k] = self.pixel(r, c, k)
         return 1
 
 
@@ -365,7 +435,8 @@ def test_status(scope):
     assert not err and out == {"xy_um": [100.0, 200.0], "z_um": 4619.0, "objective": "Plan Fluor 4x",
                                "nosepiece_position": 1, "nd_running": False, "estop_engaged": False,
                                "nosepiece": {"0": "Plan Apo 20x", "1": "Plan Fluor 4x", "2": "Plan Apo 10x"},
-                               "xy_limits_um": [[-2000.0, 2000.0], [-2000.0, 2000.0]]}
+                               "xy_limits_um": [[-2000.0, 2000.0], [-2000.0, 2000.0]],
+                               "z_devices": {"0": {"z_um": 4619.0, "rc": 1}, "1": {"z_um": 4619.0, "rc": 1}}}
 
 
 def test_move_relative_and_its_refusals(scope):
@@ -426,11 +497,367 @@ def test_capture_runs_on_the_main_thread(scope, main_thread):
     assert len(scope.calls) == 3
 
 
+def test_imaging_status(scope, monkeypatch):
+    monkeypatch.setattr(server, "LIGHT_PATH_NAMES", {2: "L100"})
+    out, err = tool("imaging_status")
+    assert not err
+    assert out["optical_config"]["camera"] == "Nikon AX:DIC_10x"
+    assert out["optical_config_rc"] == 1
+    assert out["objective"] == "Plan Fluor 4x"
+    assert out["camera_name"] == "Mock camera" and out["camera_name_rc"] == 0
+    assert "diagnostic_errors" not in out
+    assert out["light_path"] == {"port": 2, "port_name": "L100", "ports": 4}
+    assert out["shutters"] == {"EPI": "closed", "DIA": "open"} and out["estop_engaged"] is False
+    assert scope.calls == []  # no acquisition, device selection, or movement
+
+
+@pytest.mark.parametrize("config_rc", [0, 1, -4])
+def test_imaging_diagnostics_separate_hardware_names_from_blank_configs(scope, config_rc):
+    def blank_configs(obj, cam, mic, n):
+        return config_rc
+
+    scope.GetSelectedOptConf = blank_configs
+    out, err = tool("imaging_status")
+    assert not err and out["optical_config"] == {"objective": "", "camera": "", "microscope": ""}
+    assert out["optical_config_rc"] == config_rc  # no invented return-code interpretation
+    assert out["objective"] == "Plan Fluor 4x" and out["camera_name"] == "Mock camera"
+    assert scope.calls == []
+
+
+def test_imaging_diagnostics_empty_camera_is_unknown_not_disconnected(scope):
+    scope.GetCurrentCameraName = lambda name: -4
+    out, err = tool("imaging_status")
+    assert not err and out["camera_name"] is None and out["camera_name_rc"] == -4
+    assert out["objective"] == "Plan Fluor 4x" and scope.calls == []
+
+
+@pytest.mark.parametrize("function", ["GetSelectedOptConf", "GetCurrentObjName", "GetCurrentCameraName"])
+def test_imaging_diagnostic_read_error_keeps_other_readbacks(scope, function):
+    def unavailable(*args):
+        raise AttributeError("mock diagnostic unavailable")
+
+    setattr(scope, function, unavailable)
+    out, err = tool("imaging_status")
+    assert not err and out["diagnostic_errors"] == {function: "AttributeError: mock diagnostic unavailable"}
+    assert out["shutters"] == {"EPI": "closed", "DIA": "open"}
+    assert out["light_path"]["port"] == 2 and scope.calls == []
+    if function == "GetSelectedOptConf":
+        assert out["optical_config_rc"] is None and out["camera_name"] == "Mock camera"
+    elif function == "GetCurrentObjName":
+        assert out["objective"] is None and out["objective_rc"] is None
+        assert out["camera_name"] == "Mock camera"
+    else:
+        assert out["camera_name"] is None and out["camera_name_rc"] is None
+        assert out["objective"] == "Plan Fluor 4x"
+
+
+def test_camera_name_uses_new_ml_export_and_caches_binding(scope, monkeypatch):
+    resolved, loaded, calls = [], [], []
+
+    class Getter:
+        def __call__(self, name):
+            calls.append("camera name")
+            name.value = "Mock selected camera from new_ml"
+            return 0
+
+    getter = Getter()
+
+    class CameraDLL:
+        def __getattr__(self, name):
+            resolved.append(name)
+            assert name == "?GetCurrentCameraName@@YAHPEA_W@Z"
+            return getter
+
+    class MockLoader:
+        def __getattr__(self, name):
+            loaded.append(name)
+            assert name == "g5_new_ml"  # no regprocs lookup or unverified _Impl call
+            return CameraDLL()
+
+    # Exercise the production resolution branch with an entirely fake loader.
+    # NIS itself was constructed with FakeScope; no native library is loaded.
+    monkeypatch.setattr(server.ct, "cdll", MockLoader())
+    server._nis._native = True
+    assert loaded == []  # optional binding is lazy
+    for _ in range(2):
+        out, err = tool("imaging_status")
+        assert not err and out["camera_name"] == "Mock selected camera from new_ml"
+        assert out["camera_name_rc"] == 0 and "diagnostic_errors" not in out
+        assert out["objective"] == "Plan Fluor 4x"
+    assert loaded == ["g5_new_ml"] and resolved == [server.NIS.CAMERA_NAME_EXPORT]
+    assert getter.argtypes == [server.ct.c_wchar_p] and getter.restype is server.ct.c_int
+    assert calls == ["camera name", "camera name"] and scope.calls == []
+
+
+@pytest.mark.parametrize("missing", ["dll", "export"])
+def test_camera_name_new_ml_unavailable_keeps_other_diagnostics(scope, monkeypatch, missing):
+    class MissingExport:
+        def __getattr__(self, name):
+            assert name == server.NIS.CAMERA_NAME_EXPORT
+            raise AttributeError("mock camera-name export missing")
+
+    class MockLoader:
+        def __getattr__(self, name):
+            assert name == "g5_new_ml"
+            if missing == "dll":
+                raise OSError("mock camera DLL unavailable")
+            return MissingExport()
+
+    monkeypatch.setattr(server.ct, "cdll", MockLoader())
+    server._nis._native = True
+    out, err = tool("imaging_status")
+    assert not err and out["camera_name"] is None and out["camera_name_rc"] is None
+    expected = ("OSError: mock camera DLL unavailable" if missing == "dll" else
+                "AttributeError: mock camera-name export missing")
+    assert out["diagnostic_errors"] == {"GetCurrentCameraName": expected}
+    assert out["objective"] == "Plan Fluor 4x" and out["optical_config_rc"] == 1
+    assert out["light_path"]["port"] == 2 and out["shutters"] == {"EPI": "closed", "DIA": "open"}
+    assert scope.calls == []
+
+
+def test_capture_reports_intensity_and_warns_on_low_signal(scope, main_thread):
+    out, err = tool("capture", filename="stats", include_stats=True)
+    assert not err and out["saved"]
+    img = out["image"]
+    assert (img["width"], img["height"], img["bits"], img["full_scale"]) == (40, 30, 12, 4095)
+    assert img["sampled_pixels"] == 40 * 30                 # smaller than the grid: every pixel
+    ch0, ch1 = img["channels"]
+    assert (ch0["min"], ch0["max"], ch1["min"], ch1["max"]) == (0, 2, 5, 7)
+    assert ch0["saturated_fraction"] == 0
+    assert out["imaging"]["light_path"]["port"] == 2
+    assert len(out["warnings"]) == 1 and "low signal" in out["warnings"][0]     # 7 < 1% of 4095
+    assert [c[0] for c in scope.calls] == ["capture", "save", "close"]
+
+
+def test_capture_bright_and_saturated(scope, main_thread):
+    scope.pixel = lambda r, c, k: 4095 if r < 3 else 2000                  # 10% saturated
+    out, err = tool("capture", filename="bright", include_stats=True)
+    assert not err and out["image"]["channels"][0]["saturated_fraction"] == 0.1
+    assert all("saturated" in w for w in out["warnings"]) and len(out["warnings"]) == 2
+
+
+def test_capture_samples_a_grid_of_a_large_image(scope, main_thread, monkeypatch):
+    monkeypatch.setattr(server, "IMAGE_SAMPLE_GRID", 16)
+    scope.image = (1024, 512, 16, 1)
+    scope.pixel = lambda r, c, k: 30000
+    out, err = tool("capture", filename="big", include_stats=True)
+    assert not err and "warnings" not in out
+    assert out["image"]["sampled_pixels"] == 16 * 16 and out["image"]["channels"][0]["p50"] == 30000
+
+
+def test_capture_keeps_the_file_when_the_image_cannot_be_read(scope, main_thread):
+    scope.image = None
+    out, err = tool("capture", filename="noinfo", include_stats=True)
+    assert not err and out["saved"] and "error" in out["image"] and "warnings" not in out
+    assert [c[0] for c in scope.calls] == ["capture", "save", "close"]
+
+
 def test_capture_and_nd_refused_without_the_main_thread_hook(scope):
     for name, args in (("capture", {"filename": "x"}), ("run_experiment", {"experiment": "e"}),
                        ("finish_experiment", {})):
         out, err = tool(name, **args)
         assert err and "main thread" in out["error"], name
+    assert scope.calls == []
+
+
+def wait_capture(capture_id):
+    deadline = time.monotonic() + 2
+    while time.monotonic() < deadline:
+        out, err = tool("capture_status", capture_id=capture_id)
+        assert not err
+        if not out["capture_in_progress"]:
+            return out
+        time.sleep(0.005)
+    raise AssertionError("mock capture did not finish")
+
+
+def test_capture_default_skips_native_pixel_reads_and_reports_phase_timings(scope, main_thread):
+    scope.GetPixelValueEx = lambda *args: pytest.fail("default capture must skip pixel reads")
+    out, err = tool("capture", filename="fast")
+    assert not err and out["state"] == "completed" and out["statistics_skipped"]
+    assert set(out["timings_s"]) == {"queue_wait", "wait_nis", "read_imaging", "acquire", "save", "close"}
+    assert all(v >= 0 for v in out["timings_s"].values())
+    progress = tool("capture_status", capture_id=out["capture_id"])[0]
+    assert not progress["capture_in_progress"] and progress["result"] == out
+    entries = [json.loads(line) for line in server.LOG_FILE.read_text().splitlines()]
+    phases = [e["phase"] for e in entries if e.get("event") == "capture_phase_started"]
+    assert phases == ["wait_nis", "read_imaging", "acquire", "save", "close"]
+    assert sum(e.get("event") == "capture_phase_finished" for e in entries) == 5
+    assert entries[0]["event"] == "capture_queued"
+    assert any(e.get("event") == "capture_finished" and e["state"] == "completed" for e in entries)
+
+
+def test_slow_capture_returns_progress_keeps_lock_and_blocks_retries(scope, main_thread, monkeypatch):
+    monkeypatch.setattr(server, "CAPTURE_RESPONSE_WAIT_S", 0.02)
+    started, release = threading.Event(), threading.Event()
+
+    def slow_capture():
+        scope._record("capture")
+        started.set()
+        assert release.wait(2)
+        return 0  # observed NIS success code: do not mistake zero for failure
+
+    scope.Capture = slow_capture
+    try:
+        out, err = tool("capture", filename="slow")
+        assert not err and started.wait(1) and out["capture_in_progress"]
+        cid = out["capture_id"]
+        t0 = time.monotonic()
+        progress = tool("capture_status", capture_id=cid)[0]
+        assert time.monotonic() - t0 < 0.2 and progress["phase"] == "acquire"
+        assert server._nis.lock.locked()  # HTTP returned, native operation still owns NIS
+        assert tool("status")[0]["capture_in_progress"]
+        assert tool("imaging_status")[0]["capture_in_progress"]
+        assert server.call_tool("echo", {"text": "responsive"})["content"][0]["text"] == "responsive"
+        assert tool("capture", filename="duplicate")[1]
+        assert tool("move_relative", dx_um=1, dy_um=0)[1]
+        assert tool("change_objective", name="Plan Apo 10x")[1]
+        assert tool("run_experiment", experiment="e")[1]
+        assert tool("finish_experiment")[1]
+        assert tool("estop", action="engage")[0]["engaged"]
+        assert scope.calls == [("capture",)]
+    finally:
+        release.set()
+    done = wait_capture(cid)
+    assert done["state"] == "completed" and done["result"]["saved"]
+    assert not server._nis.lock.locked()
+    assert server.ESTOP.exists()  # completing the image never releases E-stop
+    assert tool("capture", filename="still_stopped")[1]
+    assert [x[0] for x in scope.calls] == ["capture", "save", "close"]
+
+
+def test_capture_queue_expires_without_late_acquisition(scope, monkeypatch):
+    ui = server.MainThread()
+    ui.installed = True  # deliberately no fake message pump yet
+    monkeypatch.setattr(server, "_ui", ui)
+    monkeypatch.setattr(server, "CAPTURE_RESPONSE_WAIT_S", 0.001)
+    out, err = tool("capture", filename="stale")
+    assert not err and out["state"] == "queued"
+    server._capture_job["queue_deadline"] = time.monotonic() - 1
+    expired = tool("capture_status", capture_id=out["capture_id"])[0]
+    assert expired["state"] == "cancelled" and not expired["capture_in_progress"]
+    ui._tick()
+    assert scope.calls == []
+
+
+def test_slow_capture_progress_over_mock_http(url, scope, main_thread, monkeypatch):
+    monkeypatch.setattr(server, "CAPTURE_RESPONSE_WAIT_S", 0.01)
+    release, started = threading.Event(), threading.Event()
+
+    def blocked():
+        scope._record("capture")
+        started.set()
+        assert release.wait(3)
+        return 0
+
+    scope.Capture = blocked
+
+    def rpc(name, args):
+        status_code, response = post(url + "/mcp", {
+            "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": {"name": name, "arguments": args}})
+        assert status_code == 200 and not response["result"]["isError"]
+        return json.loads(response["result"]["content"][0]["text"])
+
+    try:
+        result = rpc("capture", {"filename": "http_slow"})
+        assert result["capture_in_progress"]
+        assert started.wait(1)
+        progress = rpc("capture_status", {"capture_id": result["capture_id"]})
+        assert progress["capture_in_progress"] and progress["phase"] == "acquire"
+    finally:
+        release.set()
+    assert wait_capture(result["capture_id"])["result"]["saved"]
+
+
+def test_estop_is_rechecked_before_a_queued_capture_starts(scope, monkeypatch):
+    ui = server.MainThread()
+    ui.installed = True
+    monkeypatch.setattr(server, "_ui", ui)
+    monkeypatch.setattr(server, "CAPTURE_RESPONSE_WAIT_S", 0.001)
+    out, err = tool("capture", filename="queued_stop")
+    assert not err
+    tool("estop", action="engage")
+    ui._tick()
+    done = tool("capture_status", capture_id=out["capture_id"])[0]
+    assert done["state"] == "cancelled" and scope.calls == []
+
+
+def test_capture_failure_logs_exact_phase_and_does_not_save_or_close(scope, main_thread):
+    def broken_capture():
+        scope._record("capture")
+        raise RuntimeError("mock device error")
+    scope.Capture = broken_capture
+    out, err = tool("capture", filename="broken")
+    assert err and out["state"] == "failed" and "mock device error" in out["error"]
+    assert out["failed_phase"] == "acquire"
+    assert [x[0] for x in scope.calls] == ["capture"]
+    entries = [json.loads(line) for line in server.LOG_FILE.read_text().splitlines()]
+    assert any(e.get("event") == "capture_phase_error" and e["phase"] == "acquire" for e in entries)
+    assert tool("capture_status")[0]["result"] == out
+
+
+@pytest.mark.parametrize("stop_during", ["imaging_read", "acquire_phase_start"])
+def test_capture_rechecks_estop_immediately_before_acquisition(scope, main_thread, monkeypatch, stop_during):
+    if stop_during == "imaging_read":
+        original = server.NIS.imaging
+
+        def imaging_then_stop(self):
+            result = original(self)
+            server.estop({"action": "engage", "reason": "mock pre-acquisition stop"})
+            return result
+
+        monkeypatch.setattr(server.NIS, "imaging", imaging_then_stop)
+    else:
+        original = server._capture_event
+
+        def event_then_stop(job, event, **fields):
+            original(job, event, **fields)
+            if event == "capture_phase_started" and fields.get("phase") == "acquire":
+                server.estop({"action": "engage", "reason": "mock acquisition-phase stop"})
+
+        monkeypatch.setattr(server, "_capture_event", event_then_stop)
+
+    out, err = tool("capture", filename="stopped_before_acquire")
+    assert err and out["state"] == "cancelled" and out["estop_engaged"]
+    assert not out["saved"] and "e-stop" in out["error"]
+    assert scope.calls == []  # no Capture, save, close, or movement
+    assert not server.Path(out["path"]).exists()
+    assert not server._nis.lock.locked() and server.ESTOP.exists()
+    progress, query_error = tool("capture_status", capture_id=out["capture_id"])
+    assert not query_error and not progress["capture_in_progress"]
+    assert progress["state"] == "cancelled" and progress["result"] == out
+    entries = [json.loads(line) for line in server.LOG_FILE.read_text().splitlines()]
+    terminal = [entry for entry in entries if entry.get("event") == "capture_finished"]
+    assert len(terminal) == 1 and terminal[0]["state"] == "cancelled"
+    acquire_finished = [entry for entry in entries if entry.get("event") == "capture_phase_finished"
+                        and entry.get("phase") == "acquire"]
+    assert len(acquire_finished) == 1
+    assert acquire_finished[0]["took_s"] == out["timings_s"]["acquire"]
+    assert not any(entry.get("phase") in ("save", "statistics", "close") for entry in entries)
+
+
+@pytest.mark.parametrize("empty_file", [False, True])
+def test_failed_or_empty_save_leaves_document_open(scope, main_thread, empty_file):
+    def no_image_saved(path, *args):
+        if empty_file:
+            server.Path(path).touch()
+        return 0
+    scope.ImageSaveAs = no_image_saved
+    out, err = tool("capture", filename="not_saved")
+    assert err and not out["saved"] and "left open" in out["error"]
+    assert [x[0] for x in scope.calls] == ["capture"]
+    assert "save" in out["timings_s"] and "close" not in out["timings_s"]
+
+
+def test_capture_status_rejects_wrong_id_without_entering_nis(scope):
+    assert tool("capture_status")[0]["state"] == "idle"
+    assert tool("capture_status", capture_id="not-an-operation")[1]
+    assert scope.calls == []
+
+
+def test_capture_rejects_invalid_statistics_option(scope, main_thread):
+    assert tool("capture", filename="bad_option", include_stats="yes")[1]
     assert scope.calls == []
 
 
@@ -623,3 +1050,67 @@ def test_positions_are_rounded(scope):
     assert not err and out["xy_um"] == [1717.6, -1399.7] and out["z_um"] == 488.66
     out, err = tool("move_relative", dx_um=100, dy_um=0)
     assert not err and out["after_um"] == [1817.6, -1399.7]
+
+
+def test_focus_down_only_lowers(scope, monkeypatch):
+    out, err = tool("focus_down", down_um=50)
+    assert not err and out["z_before_um"] == 4619.0 and out["z_after_um"] == 4569.0
+    for bad in (-10, 0, 201, float("nan"), "up"):                 # nothing can raise it
+        out, err = tool("focus_down", down_um=bad)
+        assert err, bad
+    monkeypatch.setattr(server, "Z_MIN_UM", 4500.0)
+    out, err = tool("focus_down", down_um=100)
+    assert err and "below Z_MIN_UM" in out["error"]
+    server.ESTOP.write_text("")
+    assert "e-stop" in tool("focus_down", down_um=1)[0]["error"]
+    assert scope.calls == [("z", -50.0)]
+
+
+def test_focus_down_reports_a_z_drive_that_did_not_move(scope):
+    scope.StgMoveZ = lambda dz, rel: 1                           # accepts, never moves
+    out, err = tool("focus_down", down_um=10)
+    assert err and "did not go down" in out["error"]
+
+
+def test_focus_down_rechecks_estop_after_waiting_for_lock(scope, monkeypatch):
+    lock = server._nis.lock
+    initial_check = threading.Event()
+    original = server._stopped
+
+    def observed_check(operation):
+        result = original(operation)
+        if operation == "focus":
+            initial_check.set()
+        return result
+
+    monkeypatch.setattr(server, "_stopped", observed_check)
+    results = []
+    worker = threading.Thread(target=lambda: results.append(tool("focus_down", down_um=10)), daemon=True)
+    lock.acquire()
+    try:
+        worker.start()
+        assert initial_check.wait(2), "focus did not reach its initial E-stop check"
+        server.estop({"action": "engage", "reason": "mock focus lock-wait stop"})
+    finally:
+        lock.release()
+        worker.join(2)
+    assert not worker.is_alive() and len(results) == 1
+    out, err = results[0]
+    assert err and out["estop_engaged"] and "e-stop" in out["error"]
+    assert scope.calls == [] and scope.z == 4619.0
+    assert not lock.locked() and server.ESTOP.exists()
+
+
+def test_focus_down_rechecks_estop_after_position_read(scope, monkeypatch):
+    original = server.NIS.position
+
+    def position_then_stop(self):
+        result = original(self)
+        server.estop({"action": "engage", "reason": "mock focus position-read stop"})
+        return result
+
+    monkeypatch.setattr(server.NIS, "position", position_then_stop)
+    out, err = tool("focus_down", down_um=10)
+    assert err and out["estop_engaged"] and "e-stop" in out["error"]
+    assert scope.calls == [] and scope.z == 4619.0
+    assert not server._nis.lock.locked() and server.ESTOP.exists()
