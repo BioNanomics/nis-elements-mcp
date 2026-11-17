@@ -45,6 +45,171 @@ The limits are constants at the top of `NISMCPServer.py`: edit and save.
 Every tool call is logged as one JSON line in `~/nis-mcp/log.jsonl`: time,
 tool, arguments, result, refusals included.
 
+## Hardware validation results (2026-11-17)
+
+These checks used the real MCP server in NIS. Moves and objective changes
+were requested by the operator; the 500 um tests included an observation
+pause. Results below are based on tool responses and position readbacks,
+not independent measurement of physical travel or image displacement.
+No screen automation was used. No real capture or ND experiment was
+started during these hardware checks.
+
+### Read-only checks
+
+| Check | Result | Observed details |
+|---|---|---|
+| `echo` | Passed | Live MCP connection answered |
+| `status` | Passed | Reported XY/Z, objective, E-stop, ND state and configured limits |
+| `capture_status` | Passed | Idle, no capture in progress; also remained idle after the blocked capture request |
+| `imaging_status` | Responded; incomplete imaging information | Optical configuration fields were blank; light path port 3 of 4 had no mapped name; DIA LED, AX and D-LEDI shutters reported closed. Camera/live-view state is not exposed |
+| `list_optical_configs` | Passed | Returned 14 saved configurations; none was selected by the tool |
+| `list_experiments` | Passed | Returned 7 saved experiments and their configured time-lapse settings; none was run |
+
+### Stage and objective checks
+
+Starting XY for these tests was **X -3406.3 um, Y -3142.5 um**. Each
+successful move reported `rc: 1`. The XY and objective checks did not
+request Z movement; a separate downward focus check is recorded below.
+
+| Test | Result | Position readback / objective |
+|---|---|---|
+| +10 um X, then return | Passed | X -3406.3 -> -3396.3 -> -3406.3 um; Y unchanged |
+| +10 um Y, then return | Passed | Y -3142.5 -> -3132.5 -> -3142.5 um; X unchanged |
+| +500 um Y, pause 10 s, then return | Passed | Y -3142.5 -> -2642.5 -> -3142.5 um; X unchanged |
+| +500 um X, pause 10 s, then return | Passed | X -3406.3 -> -2906.3 -> -3406.3 um; Y unchanged |
+| 4x -> 10x, pause 10 s, then 4x | Passed for nosepiece selection | Positions 0 -> 1 -> 0; both changes reported `changed: true`, `rc: 1`. Calibration calls returned `rc_calibration: 0`; optical calibration accuracy was not independently checked |
+| Apply recorded XY endpoints | Passed for configuration loading | Repo updated to X +/-57047.0 um, Y +/-37547.0 um; live `status` confirmed the same limits |
+| `focus_down` by 10 um after manual E-stop release | Passed | Starting Z 2584.90 um; immediate `z_after_um` 2574.92 um; follow-up `status` Z 2574.84 um; `rc: 1`. XY unchanged; 4x remained selected |
+| Manual Z restoration after focus test | Passed by status readback | Operator restored Z manually; subsequent `status` confirmed 2584.90 um, matching the recorded starting Z. XY remained (-3406.3, -3142.5) um; 4x selected |
+
+For the successful focus test, the **manual restore target is Z 2584.90 um**.
+The two final readings were 2574.92 um immediately after the command and
+2574.84 um on the following status query. The operator subsequently
+restored Z manually, and a fresh `status` confirmed **2584.90 um**, matching
+the restore target. No automated upward restoration was commanded.
+
+The XY endpoint readings came from earlier manual stage movement on the
+same date. Applying them replaced an older temporary area of
+X 14024.8..16024.8 um and Y -1712.9..287.1 um. The current sample position
+was outside that old area; no automated move was made until the requested
+limit update and the operator's manual E-stop release.
+
+### Software E-stop checks
+
+Each request below was made with the E-stop engaged. A refusal is the
+expected passing result, even though the MCP response has `isError: true`.
+
+| Request while stopped | Result | Verification |
+|---|---|---|
+| `move_relative` +10 um X | Passed: move refused | XY remained (-3406.3, -3142.5) um |
+| `change_objective` to 10x | Passed: objective change refused | Status still reported 4x, nosepiece position 0 |
+| `capture` | Passed: capture refused | `capture_status` stayed idle with no capture in progress; acquisition was not started |
+| `run_experiment` for `Celegans_01_stack_timing` | Passed: ND run refused | Status reported `nd_running: false`; the saved experiment is configured for 90 s, 5 frames at 20 s intervals |
+| `focus_down` by 10 um | Passed: focus refused | Z readback was 2584.90 um before and after; no Z move was issued |
+
+After the E-stop refusal checks, the operator manually released the E-stop
+for the successful focus test and the restriction checks below.
+At the last recorded status after restoring the XY limits following the
+boundary checks, the software
+E-stop was **released**, the objective was **4x**, XY was
+**(-3406.3, -3142.5) um**, and Z was **2584.90 um**. The earlier manual
+restoration readback was 2584.90 um. No ND experiment was running. This is a dated
+record, not current instrument state; call `status` before further work.
+The E-stop is a software command interlock, not validation of a physical
+emergency-stop circuit or cancellation of an already-running native call.
+Only a person releases it.
+
+### Restriction checks with E-stop released
+
+These requests reached the live server with the E-stop released, so the
+refusals below verify the individual restrictions rather than the E-stop
+interlock. Status was read before and after each request.
+
+| Request | Result | Verification |
+|---|---|---|
+| `move_relative` +1001 um X, 0 um Y | Passed: maximum step exceeded | Returned `steps over 1000 um per axis are refused, got (1001, 0)`; XY remained (-3406.3, -3142.5) um; no movement occurred |
+| `move_relative` 0 um X, +1001 um Y | Passed: maximum step exceeded | Returned `steps over 1000 um per axis are refused, got (0, 1001)`; XY remained (-3406.3, -3142.5) um; no movement occurred |
+| `change_objective` to `20x` | Passed: objective restricted | Returned `only 4x/10x objectives are allowed, got '20x'`; 4x and nosepiece position 0 remained selected; no nosepiece movement occurred |
+| `run_experiment` for `Celegans_02_pilot_short_60s` | Passed: 30-minute duration limit | `list_experiments` confirmed 3600 s (60 min), 61 frames at 60 s intervals. The server refused it as exceeding `MAX_ND_RUN_S` (30 min); status remained `nd_running: false`; no experiment started |
+| `focus_down` by 201 um | Passed: 200 um maximum exceeded | Returned `down_um must be above 0 and at most 200 um, got 201`; status before and after reported Z 2584.94 um and XY (-3406.3, -3142.5) um, with 4x selected and E-stop released. No hardware moved |
+
+For the first four checks, XY remained **(-3406.3, -3142.5) um**, Z read
+**2584.92 um**, and the objective remained **4x**. The experiment's `60s`
+name suffix describes its interval, not its total duration.
+The later 201 um focus-limit check also passed without movement; its Z
+readback remained **2584.94 um** before and after the refusal.
+
+### Configured XY boundary rejection
+
+Both positive-axis boundary checks passed on the live server with the
+E-stop released. The operator confirmed clearance for a 10 um move before
+the test. A temporary software rectangle was placed +/-5 um around the
+starting XY; the stage was not moved to a physical travel edge.
+
+| Configuration / readback | X (um) | Y (um) |
+|---|---|---|
+| Starting position | -3406.3 | -3142.5 |
+| Temporary minimum | -3411.3 | -3147.5 |
+| Temporary maximum | -3401.3 | -3137.5 |
+| Final position after both refusals and restoration | -3406.3 | -3142.5 |
+| Restored original minimum | -57047.0 | -37547.0 |
+| Restored original maximum | +57047.0 | +37547.0 |
+
+The live `status` response confirmed the temporary limits before either
+request was submitted.
+
+| Request | Result | Rejected target / position verification |
+|---|---|---|
+| +10 um X, 0 um Y | Passed: outside safe XY area | Target (-3396.3, -3142.5) um exceeded temporary X maximum -3401.3 um; reported position and follow-up status remained (-3406.3, -3142.5) um |
+| 0 um X, +10 um Y | Passed: outside safe XY area | Target (-3406.3, -3132.5) um exceeded temporary Y maximum -3137.5 um; reported position and final status remained (-3406.3, -3142.5) um |
+
+These 10 um requests were below the 1000 um maximum step, so their
+refusals specifically exercised `XY_LIMITS_UM`. No stage movement occurred.
+Afterward, the original limits were restored in the repo and confirmed by
+the live server: X +/-57047.0 um, Y +/-37547.0 um. The entire source file
+matched its pre-test backup byte for byte. Final status reported 4x,
+Z 2584.90 um, no ND run, and E-stop released.
+
+Tool-call evidence is in `~/nis-mcp/log.jsonl` (on this PC,
+`C:\Users\AX Confocal\nis-mcp\log.jsonl`), including refused requests.
+
+### Mock validation and remaining work
+
+Latest repo run: `Run-MockTests.ps1` on **2026-11-17 at 13:56 local time**
+reported **59 passed, 1 excluded** (`1 deselected` in pytest output), with
+**exit code 0**. The excluded test reads actual NIS experiment settings.
+The saved JUnit report confirms 59 tests, zero failures and zero errors.
+NIS and the live MCP server were untouched; no real capture or experiment
+started.
+
+Saved report:
+
+```text
+D:\QurratulAin_ConfocalOrchestratorProject\Confocal_MCP\nis-mcp-server\test-reports\mock-20261117-135615-b5a0e12c\results.xml
+```
+
+Saved console log:
+
+```text
+D:\QurratulAin_ConfocalOrchestratorProject\Confocal_MCP\nis-mcp-server\test-reports\mock-20261117-135615-b5a0e12c\pytest.log
+```
+
+The last full mock-only run passed **59 tests**, with **1 deselected**
+because it reads this PC's actual saved NIS experiment settings. Successful
+and failed captures over isolated HTTP both verified progress, phase
+timings, terminal results and logs. After the XY limit update, the 3
+movement/E-stop mock tests also passed. Use `Run-MockTests.ps1` below to
+rerun the full suite and save reports.
+
+| Still needs testing | Scope / prerequisite |
+|---|---|
+| Non-laser camera acquisition | Await the NIS-integrated camera. Set up a compatible transmitted-light brightfield/DIC camera path and verify a useful live image before a real capture |
+| Real capture with the updated code | Validate progress polling, phase timings, NIS responsiveness, ND2 readability, image quality and document handling on actual acquisition. Mock success does not establish these |
+| Optical configuration selection verification | Pending: the operator sees no optical configuration button highlighted, so blank active configuration names appear expected. Selecting a known configuration and checking its reported names is deferred because selection changes settings; no configuration was applied for this investigation |
+| Imaging-state reporting | Camera-name binding via `g5_new_ml.dll` passed a live read-only check, returning `Nikon_Confocal_Ax`. Light-path port-name mapping and live-view reporting remain pending |
+| ND run and finish behavior | Successful runs, `finish_experiment`, busy-state reporting and actual timing remain unvalidated in this session. Do not run automatically as part of safety tests |
+| Geometry and accuracy | Confirm clearance for the current holder/sample/objective and validate calibration, repeatability and image displacement as needed; endpoint readings and software readbacks alone do not establish these |
+
 ## Imaging diagnostics (0.8.3)
 
 `imaging_status` retains the existing `optical_config`, `light_path`,
