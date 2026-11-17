@@ -87,6 +87,125 @@ do not use this change as proof that a capture is safe for an unknown setup.
 Auto-reload is deferred while a capture is queued/running so an executing
 operation cannot lose its reservation or progress state.
 
+### Mock-only verification
+
+Run these commands in a normal PowerShell terminal, outside NIS. NIS does
+not need to be open, and the MCPServer job does not need to be restarted.
+The mock tests do not connect to NIS, use lasers, move hardware, or capture
+a real image.
+
+First, open the repo and install the test dependency once with a standalone
+Python 3.11+ interpreter:
+
+```powershell
+Set-Location 'D:\QurratulAin_ConfocalOrchestratorProject\Confocal_MCP\nis-mcp-server'
+python --version
+python -m pip install pytest
+```
+
+Run the full mock-only suite and save reports:
+
+```powershell
+.\Run-MockTests.ps1
+```
+
+To run it from any other directory:
+
+```powershell
+& 'D:\QurratulAin_ConfocalOrchestratorProject\Confocal_MCP\nis-mcp-server\Run-MockTests.ps1'
+```
+
+The runner uses standalone `python` (Python 3.11+ with `pytest` installed)
+and works from any current directory when called by its full path. It runs
+both test files and excludes `test_reads_this_pcs_saved_experiments`. Each
+run saves `results.xml` (JUnit), `pytest.log`, and temporary mock artifacts
+under a unique `test-reports/mock-...` directory and prints their paths.
+The report directory is ignored by Git. It returns pytest's exit code,
+including a nonzero code on failure, and does not install dependencies or
+start, stop, or contact the live MCP server.
+
+To choose a Python executable or another report directory:
+
+```powershell
+.\Run-MockTests.ps1 -Python 'C:\path\to\python.exe' -ReportDirectory 'D:\MockReports'
+```
+
+To run the full suite directly without the report-saving wrapper:
+
+```powershell
+python -m pytest -q -ra test_nis_mcp.py test_capture_mock_http.py -k "not reads_this_pcs_saved_experiments"
+```
+
+The fake-scope tests refuse any attempt to instantiate the real NIS DLL.
+HTTP tests bind ephemeral ports, and reload tests use a fake UI hook; they
+do not contact the real MCP endpoint. The optional SDK test is skipped when
+its dependencies are absent. The excluded test reads this PC's actual ND
+settings file and is not part of the mock-only suite.
+
+To replay just the successful and failed captures through the MCP HTTP
+interface:
+
+```powershell
+python -m pytest -q -s test_capture_mock_http.py
+```
+
+Run only the successful capture mock:
+
+```powershell
+python -m pytest -q -s test_capture_mock_http.py::test_successful_capture_progress_and_timing_logs
+```
+
+Run only the failed capture mock:
+
+```powershell
+python -m pytest -q -s test_capture_mock_http.py::test_failed_capture_progress_and_timing_logs
+```
+
+These two tests use a fake microscope, a fake UI loop, temporary capture/log
+files, and a separate HTTP server on an automatically assigned local port.
+They do not contact the live MCP server or require NIS to be open. They
+reject real NIS DLL initialization. The successful test checks progress
+through acquisition and save; the failed test injects an acquisition error
+and checks that no save or close occurs. Both verify the final
+`capture_status`, phase durations, terminal log event, and lock release.
+The failure is reported inside `capture_status.result.error`; the status
+query itself succeeds.
+
+With `-s`, each test prints its timing summary and the paths to
+`progress.json` (HTTP responses) and `log.jsonl` (phase events). These are
+pytest temporary files; copy them elsewhere if you want to keep them across
+future runs. Saved mock ND2 bytes are test data, not a real image.
+
+The PowerShell runner retains those artifacts under its own report folder:
+
+```text
+test-reports/
+  mock-<timestamp>-<unique-id>/
+    results.xml                  JUnit test results
+    pytest.log                   Console output and timing summaries
+    test-data/
+      test_successful_capture.../
+        progress.json            Capture and capture_status responses
+        log.jsonl                Phase timing events
+      test_failed_capture.../
+        progress.json            Failed operation and error details
+        log.jsonl                Error event and phase timings
+```
+
+The suite also creates temporary files for its other mocked tests under
+`test-data`. For automation, run the script in a child PowerShell process
+and inspect its exit code:
+
+```powershell
+powershell -NoProfile -File .\Run-MockTests.ps1
+$LASTEXITCODE
+```
+
+Exit code `0` means the tests passed; a nonzero code means a failure or
+setup problem. The last verified full run reported **59 passed, 1
+deselected**; the deselected test reads actual NIS experiment settings.
+If optional MCP SDK dependencies are absent, that client test is skipped.
+
 On connect the server sends instructions telling the agent to check the
 scope's state with a tool rather than remember it: a person can move the
 stage or release the e-stop at any time.
@@ -107,6 +226,7 @@ Nikon and NIS-Elements are trademarks of Nikon Corporation.
 | `install_job.py` | creates the `MCPServer` job in NIS's JOBS database; the job just loads `NISMCPServer.py` from this folder |
 | `test_nis_mcp.py` | tests (`pytest`; one test uses the `mcp` SDK if installed) |
 | `test_capture_mock_http.py` | repeatable successful/failed capture progress and timing tests, using mocks over HTTP |
+| `Run-MockTests.ps1` | runs the full mock-only suite and saves reports and mock artifacts |
 
 ## Install
 
