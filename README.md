@@ -15,7 +15,8 @@ the PC besides NIS: the server uses only the standard library.
 | `change_objective` | turns the nosepiece and switches NIS's calibration; 4x and 10x only |
 | `list_optical_configs` | the optical configurations defined in NIS (read-only; select one in NIS) |
 | `imaging_status` | the active optical configuration (objective, camera and microscope parts), the light path port and each shutter's state (read-only) |
-| `capture` | one image with the active optical configuration, saved as ND2 in `~/nis-mcp/captures`, by plain file name, never overwriting. Reports the imaging state it used and each channel's intensity (min/max/mean/percentiles/saturation, from a 64 x 64 sample of pixels), with a warning for a nearly blank or saturated image |
+| `capture` | one image with the active optical configuration, saved as ND2 in `~/nis-mcp/captures`, by plain file name, never overwriting. Returns promptly with a capture ID and queued/running state for a slow capture; fast captures can return their completed result. Per-phase timings are included. `include_stats=true` opts into sampled intensity statistics; they are skipped by default |
+| `capture_status` | cached progress/result for the current or last capture, optionally checked against `capture_id`; never enters NIS or waits for its UI |
 | `list_experiments` | the ND experiments saved in NIS, with each one's loops, time-lapse length (or "single pass"), interval/duration/frames, Z steps and output file (read-only) |
 | `run_experiment` | runs an ND experiment saved in NIS's ND Acquisition window, by name; a name that is not saved, or a time-lapse over 30 min, is refused |
 | `finish_experiment` | ends the running ND experiment after its current loop |
@@ -44,6 +45,48 @@ The limits are constants at the top of `NISMCPServer.py`: edit and save.
 Every tool call is logged as one JSON line in `~/nis-mcp/log.jsonl`: time,
 tool, arguments, result, refusals included.
 
+## Capture progress (0.8.1)
+
+Call `capture` with `{"filename": "sample_check"}`. A fast operation returns
+`state: "completed"` and `saved: true`. A slow operation returns within about
+one second with `capture_id`, `capture_in_progress: true`, and its current
+`phase`. This is pending, not success, failure, or cancellation. Do not retry
+the capture. Poll `capture_status` with that ID until `capture_in_progress`
+is false; the terminal `result` contains the saved path or error. Only the
+current/last capture ID is retained, so retrieve it before starting another.
+
+Phases are `queued`, `wait_nis`, `read_imaging`, `acquire`, `save`, optional `statistics`,
+and `close`, followed by `completed`, `failed`, or `cancelled`. Timings use a
+monotonic clock. The log also appends timestamped `capture_queued`,
+`capture_phase_started`, `capture_phase_finished`, `capture_phase_error`,
+and `capture_finished` records, keyed by `capture_id`. A completion record
+is written even if the original HTTP client has stopped waiting.
+
+While queued/running, native NIS tools (including duplicate captures) are
+refused. `status` and `imaging_status` return cached capture progress rather
+than entering NIS; they do not claim to read current XYZ/imaging settings.
+`capture_status`, `echo`, `estop`, and file-based `list_experiments` remain
+available. A capture queued longer than 30 seconds expires and cannot start
+late. Once native acquisition starts it is **not cancelled** by an HTTP
+timeout, disconnect, or E-stop. E-stop blocks new acquisitions; a frame
+already acquired may still be saved and closed to preserve its data.
+
+NIS acquisition remains on its UI thread. A long quality-mode confocal scan
+can still make NIS itself unresponsive: this change provides observable
+progress and prevents retries; it does not introduce an asynchronous Nikon
+acquisition engine or shorten the saved acquisition settings. All optical
+settings, camera choice, laser settings, XYZ, and limits are left unchanged.
+
+Statistics are now opt-in because a 64 x 64 grid requires 4096 native pixel
+reads on the UI thread. Use `include_stats: true` only when needed; preferably
+analyze the saved ND2 outside NIS. Nonempty output is checked before closing
+the image. A nonempty file does not establish readability or useful signal.
+Native return-code meanings and document identity are not fully validated;
+do not use this change as proof that a capture is safe for an unknown setup.
+
+Auto-reload is deferred while a capture is queued/running so an executing
+operation cannot lose its reservation or progress state.
+
 On connect the server sends instructions telling the agent to check the
 scope's state with a tool rather than remember it: a person can move the
 stage or release the e-stop at any time.
@@ -63,6 +106,7 @@ Nikon and NIS-Elements are trademarks of Nikon Corporation.
 | `NISMCPServer.py` | the server |
 | `install_job.py` | creates the `MCPServer` job in NIS's JOBS database; the job just loads `NISMCPServer.py` from this folder |
 | `test_nis_mcp.py` | tests (`pytest`; one test uses the `mcp` SDK if installed) |
+| `test_capture_mock_http.py` | repeatable successful/failed capture progress and timing tests, using mocks over HTTP |
 
 ## Install
 

@@ -20,6 +20,15 @@ import NISMCPServer as server
 def no_real_log(monkeypatch, tmp_path):
     """Tests never write to the scope's own log."""
     monkeypatch.setattr(server, "LOG_FILE", tmp_path / "log.jsonl")
+    monkeypatch.setattr(server, "_capture_job", None)
+    native_init = server.NIS.__init__
+
+    def mock_only_init(self, dll=None):
+        if dll is None:
+            raise AssertionError("Tests must never connect to real NIS")
+        native_init(self, dll)
+
+    monkeypatch.setattr(server.NIS, "__init__", mock_only_init)
 
 
 @pytest.fixture
@@ -48,7 +57,7 @@ def test_handshake_list_and_echo(url):
     assert post(url + "/mcp", {"jsonrpc": "2.0", "method": "notifications/initialized"})[0] == 202
     tools = post(url + "/mcp", {"jsonrpc": "2.0", "id": 2, "method": "tools/list"})[1]["result"]["tools"]
     assert [t["name"] for t in tools] == ["echo", "status", "move_relative", "focus_down", "change_objective",
-                                          "list_optical_configs", "imaging_status", "capture",
+                                          "list_optical_configs", "imaging_status", "capture", "capture_status",
                                           "list_experiments",
                                           "run_experiment",
                                           "finish_experiment", "estop"]
@@ -105,6 +114,8 @@ def test_reloads_on_save_and_keeps_serving_broken_code(tmp_path, monkeypatch):
     spec = importlib.util.spec_from_file_location("NISMCPServer", path)
     first = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(first)                      # what the job's loader does
+    # No real Windows timer or NIS connection, even on the microscope PC.
+    monkeypatch.setattr(first.MainThread, "install", lambda self: setattr(self, "installed", True))
     first.run(None, None, None, None)
 
     def version():
@@ -123,7 +134,14 @@ def test_reloads_on_save_and_keeps_serving_broken_code(tmp_path, monkeypatch):
 
     try:
         assert version() == server.VERSION
+        now = time.monotonic()
+        first._capture_job = {"capture_id": "mock-running", "state": "running", "phase": "acquire",
+                              "path": "mock.nd2", "timings_s": {}, "started_mono": now,
+                              "phase_started_mono": now, "queue_deadline": now + 30}
         path.write_text(source.replace(f'"{server.VERSION}"', '"9.9.9"'), encoding="utf-8")
+        time.sleep(0.8)
+        assert version() == server.VERSION             # active capture ownership cannot be reloaded away
+        first._capture_job = None
         assert wait_for("9.9.9")
         path.write_text(source + "\nthis is not python\n", encoding="utf-8")
         time.sleep(1.5)
@@ -200,7 +218,8 @@ class FakeScope:
 
     def ImageSaveAs(self, path, kind, compression):
         assert kind == server.ND2_ALL_LAYERS
-        open(path, "wb").close()
+        with open(path, "wb") as f:
+            f.write(b"mock ND2 data")
         return self._record("save", path)
 
     def CloseCurrentDocument(self, query):
@@ -484,7 +503,7 @@ def test_imaging_status(scope, monkeypatch):
 
 
 def test_capture_reports_intensity_and_warns_on_low_signal(scope, main_thread):
-    out, err = tool("capture", filename="stats")
+    out, err = tool("capture", filename="stats", include_stats=True)
     assert not err and out["saved"]
     img = out["image"]
     assert (img["width"], img["height"], img["bits"], img["full_scale"]) == (40, 30, 12, 4095)
@@ -499,7 +518,7 @@ def test_capture_reports_intensity_and_warns_on_low_signal(scope, main_thread):
 
 def test_capture_bright_and_saturated(scope, main_thread):
     scope.pixel = lambda r, c, k: 4095 if r < 3 else 2000                  # 10% saturated
-    out, err = tool("capture", filename="bright")
+    out, err = tool("capture", filename="bright", include_stats=True)
     assert not err and out["image"]["channels"][0]["saturated_fraction"] == 0.1
     assert all("saturated" in w for w in out["warnings"]) and len(out["warnings"]) == 2
 
@@ -508,14 +527,14 @@ def test_capture_samples_a_grid_of_a_large_image(scope, main_thread, monkeypatch
     monkeypatch.setattr(server, "IMAGE_SAMPLE_GRID", 16)
     scope.image = (1024, 512, 16, 1)
     scope.pixel = lambda r, c, k: 30000
-    out, err = tool("capture", filename="big")
+    out, err = tool("capture", filename="big", include_stats=True)
     assert not err and "warnings" not in out
     assert out["image"]["sampled_pixels"] == 16 * 16 and out["image"]["channels"][0]["p50"] == 30000
 
 
 def test_capture_keeps_the_file_when_the_image_cannot_be_read(scope, main_thread):
     scope.image = None
-    out, err = tool("capture", filename="noinfo")
+    out, err = tool("capture", filename="noinfo", include_stats=True)
     assert not err and out["saved"] and "error" in out["image"] and "warnings" not in out
     assert [c[0] for c in scope.calls] == ["capture", "save", "close"]
 
@@ -525,6 +544,167 @@ def test_capture_and_nd_refused_without_the_main_thread_hook(scope):
                        ("finish_experiment", {})):
         out, err = tool(name, **args)
         assert err and "main thread" in out["error"], name
+    assert scope.calls == []
+
+
+def wait_capture(capture_id):
+    deadline = time.monotonic() + 2
+    while time.monotonic() < deadline:
+        out, err = tool("capture_status", capture_id=capture_id)
+        assert not err
+        if not out["capture_in_progress"]:
+            return out
+        time.sleep(0.005)
+    raise AssertionError("mock capture did not finish")
+
+
+def test_capture_default_skips_native_pixel_reads_and_reports_phase_timings(scope, main_thread):
+    scope.GetPixelValueEx = lambda *args: pytest.fail("default capture must skip pixel reads")
+    out, err = tool("capture", filename="fast")
+    assert not err and out["state"] == "completed" and out["statistics_skipped"]
+    assert set(out["timings_s"]) == {"queue_wait", "wait_nis", "read_imaging", "acquire", "save", "close"}
+    assert all(v >= 0 for v in out["timings_s"].values())
+    progress = tool("capture_status", capture_id=out["capture_id"])[0]
+    assert not progress["capture_in_progress"] and progress["result"] == out
+    entries = [json.loads(line) for line in server.LOG_FILE.read_text().splitlines()]
+    phases = [e["phase"] for e in entries if e.get("event") == "capture_phase_started"]
+    assert phases == ["wait_nis", "read_imaging", "acquire", "save", "close"]
+    assert sum(e.get("event") == "capture_phase_finished" for e in entries) == 5
+    assert entries[0]["event"] == "capture_queued"
+    assert any(e.get("event") == "capture_finished" and e["state"] == "completed" for e in entries)
+
+
+def test_slow_capture_returns_progress_keeps_lock_and_blocks_retries(scope, main_thread, monkeypatch):
+    monkeypatch.setattr(server, "CAPTURE_RESPONSE_WAIT_S", 0.02)
+    started, release = threading.Event(), threading.Event()
+
+    def slow_capture():
+        scope._record("capture")
+        started.set()
+        assert release.wait(2)
+        return 0  # observed NIS success code: do not mistake zero for failure
+
+    scope.Capture = slow_capture
+    try:
+        out, err = tool("capture", filename="slow")
+        assert not err and started.wait(1) and out["capture_in_progress"]
+        cid = out["capture_id"]
+        t0 = time.monotonic()
+        progress = tool("capture_status", capture_id=cid)[0]
+        assert time.monotonic() - t0 < 0.2 and progress["phase"] == "acquire"
+        assert server._nis.lock.locked()  # HTTP returned, native operation still owns NIS
+        assert tool("status")[0]["capture_in_progress"]
+        assert tool("imaging_status")[0]["capture_in_progress"]
+        assert server.call_tool("echo", {"text": "responsive"})["content"][0]["text"] == "responsive"
+        assert tool("capture", filename="duplicate")[1]
+        assert tool("move_relative", dx_um=1, dy_um=0)[1]
+        assert tool("change_objective", name="Plan Apo 10x")[1]
+        assert tool("run_experiment", experiment="e")[1]
+        assert tool("finish_experiment")[1]
+        assert tool("estop", action="engage")[0]["engaged"]
+        assert scope.calls == [("capture",)]
+    finally:
+        release.set()
+    done = wait_capture(cid)
+    assert done["state"] == "completed" and done["result"]["saved"]
+    assert not server._nis.lock.locked()
+    assert server.ESTOP.exists()  # completing the image never releases E-stop
+    assert tool("capture", filename="still_stopped")[1]
+    assert [x[0] for x in scope.calls] == ["capture", "save", "close"]
+
+
+def test_capture_queue_expires_without_late_acquisition(scope, monkeypatch):
+    ui = server.MainThread()
+    ui.installed = True  # deliberately no fake message pump yet
+    monkeypatch.setattr(server, "_ui", ui)
+    monkeypatch.setattr(server, "CAPTURE_RESPONSE_WAIT_S", 0.001)
+    out, err = tool("capture", filename="stale")
+    assert not err and out["state"] == "queued"
+    server._capture_job["queue_deadline"] = time.monotonic() - 1
+    expired = tool("capture_status", capture_id=out["capture_id"])[0]
+    assert expired["state"] == "cancelled" and not expired["capture_in_progress"]
+    ui._tick()
+    assert scope.calls == []
+
+
+def test_slow_capture_progress_over_mock_http(url, scope, main_thread, monkeypatch):
+    monkeypatch.setattr(server, "CAPTURE_RESPONSE_WAIT_S", 0.01)
+    release, started = threading.Event(), threading.Event()
+
+    def blocked():
+        scope._record("capture")
+        started.set()
+        assert release.wait(3)
+        return 0
+
+    scope.Capture = blocked
+
+    def rpc(name, args):
+        status_code, response = post(url + "/mcp", {
+            "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": {"name": name, "arguments": args}})
+        assert status_code == 200 and not response["result"]["isError"]
+        return json.loads(response["result"]["content"][0]["text"])
+
+    try:
+        result = rpc("capture", {"filename": "http_slow"})
+        assert result["capture_in_progress"]
+        assert started.wait(1)
+        progress = rpc("capture_status", {"capture_id": result["capture_id"]})
+        assert progress["capture_in_progress"] and progress["phase"] == "acquire"
+    finally:
+        release.set()
+    assert wait_capture(result["capture_id"])["result"]["saved"]
+
+
+def test_estop_is_rechecked_before_a_queued_capture_starts(scope, monkeypatch):
+    ui = server.MainThread()
+    ui.installed = True
+    monkeypatch.setattr(server, "_ui", ui)
+    monkeypatch.setattr(server, "CAPTURE_RESPONSE_WAIT_S", 0.001)
+    out, err = tool("capture", filename="queued_stop")
+    assert not err
+    tool("estop", action="engage")
+    ui._tick()
+    done = tool("capture_status", capture_id=out["capture_id"])[0]
+    assert done["state"] == "cancelled" and scope.calls == []
+
+
+def test_capture_failure_logs_exact_phase_and_does_not_save_or_close(scope, main_thread):
+    def broken_capture():
+        scope._record("capture")
+        raise RuntimeError("mock device error")
+    scope.Capture = broken_capture
+    out, err = tool("capture", filename="broken")
+    assert err and out["state"] == "failed" and "mock device error" in out["error"]
+    assert out["failed_phase"] == "acquire"
+    assert [x[0] for x in scope.calls] == ["capture"]
+    entries = [json.loads(line) for line in server.LOG_FILE.read_text().splitlines()]
+    assert any(e.get("event") == "capture_phase_error" and e["phase"] == "acquire" for e in entries)
+    assert tool("capture_status")[0]["result"] == out
+
+
+@pytest.mark.parametrize("empty_file", [False, True])
+def test_failed_or_empty_save_leaves_document_open(scope, main_thread, empty_file):
+    def no_image_saved(path, *args):
+        if empty_file:
+            server.Path(path).touch()
+        return 0
+    scope.ImageSaveAs = no_image_saved
+    out, err = tool("capture", filename="not_saved")
+    assert err and not out["saved"] and "left open" in out["error"]
+    assert [x[0] for x in scope.calls] == ["capture"]
+    assert "save" in out["timings_s"] and "close" not in out["timings_s"]
+
+
+def test_capture_status_rejects_wrong_id_without_entering_nis(scope):
+    assert tool("capture_status")[0]["state"] == "idle"
+    assert tool("capture_status", capture_id="not-an-operation")[1]
+    assert scope.calls == []
+
+
+def test_capture_rejects_invalid_statistics_option(scope, main_thread):
+    assert tool("capture", filename="bad_option", include_stats="yes")[1]
     assert scope.calls == []
 
 

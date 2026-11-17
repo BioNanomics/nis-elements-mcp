@@ -12,7 +12,7 @@ except ImportError:          # off the microscope (tests, python NISMCPServer.py
 # NIS stays responsive. Standard library only.
 #
 # Tools: echo, status, move_relative, focus_down, change_objective, list_optical_configs,
-# imaging_status, capture, list_experiments, run_experiment, finish_experiment, estop.
+# imaging_status, capture, capture_status, list_experiments, run_experiment, finish_experiment, estop.
 #
 # Safety:
 #   * nothing moves or starts while the e-stop file exists (~/.nis-mcp/ESTOP).
@@ -54,12 +54,13 @@ import struct
 import threading
 import time
 import urllib.request
+import uuid
 import zlib
 from pathlib import Path
 
 HOST = "127.0.0.1"
 PORT = int(os.environ.get("NIS_MCP_PORT", "").strip() or 8767)
-NAME, VERSION = "nis-mcp-server", "0.8.0"
+NAME, VERSION = "nis-mcp-server", "0.8.1"
 WATCH_S = 1.0                   # how often to look for a changed file
 PROTOCOL_VERSIONS = ("2025-11-25", "2025-06-18", "2025-03-26")   # newest first
 
@@ -76,6 +77,8 @@ Z_MIN_UM = 0.0
 XY_LIMITS_UM = ((-4102.4, -102.4), (-3599.5, 400.5))
 CAPTURE_DIR = Path.home() / "nis-mcp" / "captures"
 IMAGE_SAMPLE_GRID = 64          # capture reads a 64 x 64 grid of pixels for its intensity stats
+CAPTURE_RESPONSE_WAIT_S = 1.0   # return progress rather than hold HTTP open for a slow acquisition
+CAPTURE_QUEUE_TIMEOUT_S = 30.0  # never start a stale capture queued behind a blocked NIS UI
 LOW_SIGNAL_FRACTION = 0.01      # warn when the brightest channel's p99 is under 1% of full scale
 SATURATED_FRACTION = 0.01       # warn when over 1% of a channel's sampled pixels are saturated
 # Light path port numbers -> names, as NIS shows them (fill in on the scope:
@@ -322,8 +325,97 @@ class MainThread:
             cancelled.set()
             return {"error": f"NIS's main thread did not run the call within {timeout_s:.0f} s"}
 
+    def submit(self, fn):
+        """Queue without cancelling an executing native call when HTTP stops waiting.
+
+        The capture operation itself owns its deadline and completion state.
+        No worker thread may execute this function as a fallback.
+        """
+        if not self.installed:
+            raise RuntimeError("no hook on NIS's main thread: run the MCPServer job in NIS")
+        box = queue.Queue()
+        self._jobs.put((fn, box, threading.Event()))
+        return box
+
 
 _ui = MainThread()                      # replaced by run()
+
+# One reserved capture, including its last terminal result. All progress reads
+# are cached Python state: they must never enter NIS or wait on nis().held().
+_capture_guard = threading.RLock()
+_capture_job = None
+
+
+def _capture_event(job, event, **fields):
+    entry = {"time": datetime.datetime.now().isoformat(timespec="milliseconds"),
+             "event": event, "capture_id": job["capture_id"], **fields}
+    try:
+        with _log_lock:
+            LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+            with LOG_FILE.open("a", encoding="utf-8") as f:
+                f.write(json.dumps(entry, ensure_ascii=False, default=str) + "\n")
+    except Exception as e:
+        print(f"NIS MCP server: capture progress log failed: {e}")
+
+
+def _capture_finish(job, result, state):
+    with _capture_guard:
+        job["state"], job["phase"] = state, state
+        job["ended_mono"] = time.monotonic()
+        job["result"] = {**result, "capture_id": job["capture_id"], "state": state,
+                         "timings_s": dict(job["timings_s"]),
+                         "total_s": round(job["ended_mono"] - job["started_mono"], 6)}
+        _capture_event(job, "capture_finished", state=state,
+                       total_s=job["result"]["total_s"], error=result.get("error"))
+        return job["result"]
+
+
+def _capture_snapshot():
+    with _capture_guard:
+        job = _capture_job
+        if job is None:
+            return {"capture_in_progress": False, "state": "idle"}
+        now = time.monotonic()
+        if job["state"] == "queued" and now >= job["queue_deadline"]:
+            _capture_finish(job, {"error": "capture expired in the UI queue; no acquisition was started"},
+                            "cancelled")
+        end = job.get("ended_mono", now)
+        out = {k: job[k] for k in ("capture_id", "state", "phase", "path", "timings_s")}
+        out.update(capture_in_progress=job["state"] in ("queued", "running"),
+                   elapsed_s=round(end - job["started_mono"], 6),
+                   phase_elapsed_s=round(end - job["phase_started_mono"], 6)
+                   if job["state"] in ("queued", "running") else 0.0)
+        if "result" in job:
+            out["result"] = job["result"]
+        # No references to mutable state escape the lock.
+        return json.loads(json.dumps(out))
+
+
+def capture_status(args: dict) -> dict:
+    out = _capture_snapshot()
+    requested = args.get("capture_id")
+    if requested is not None and requested != out.get("capture_id"):
+        return {"error": "capture ID is not the current/last operation", "capture_id": requested}
+    out["estop_engaged"] = estop_engaged()
+    return out
+
+
+@contextlib.contextmanager
+def _capture_phase(job, phase):
+    started = time.monotonic()
+    with _capture_guard:
+        job["phase"], job["phase_started_mono"] = phase, started
+        _capture_event(job, "capture_phase_started", phase=phase)
+    try:
+        yield
+    except Exception as e:
+        _capture_event(job, "capture_phase_error", phase=phase, error=f"{type(e).__name__}: {e}")
+        raise
+    finally:
+        with _capture_guard:
+            elapsed = round(time.monotonic() - started, 6)
+            job["timings_s"][phase] = elapsed
+            _capture_event(job, "capture_phase_finished", phase=phase, took_s=elapsed)
 
 
 def magnification(name: str) -> "float | None":
@@ -359,6 +451,11 @@ _nd_run: "dict | None" = None
 
 
 def status(args: dict) -> dict:
+    progress = _capture_snapshot()
+    if progress["capture_in_progress"]:
+        return {"capture_in_progress": True, "capture": progress,
+                "estop_engaged": estop_engaged(), "xy_limits_um": XY_LIMITS_UM,
+                "note": "capture is using/queued for NIS; XYZ and objective are not read now"}
     run = _nd_run
     if run is not None:
         elapsed = time.time() - datetime.datetime.fromisoformat(run["started"]).timestamp()
@@ -489,6 +586,7 @@ def list_optical_configs(args: dict) -> dict:
 
 
 def capture(args: dict) -> dict:
+    global _capture_job
     name = args.get("filename")
     if not isinstance(name, str):
         return {"error": "capture needs a 'filename'"}
@@ -497,33 +595,99 @@ def capture(args: dict) -> dict:
         return {"error": "filename must be a plain name (letters, digits, space, _ . -), no folders"}
     if (r := _stopped("capture")):
         return r
+    if not _ui.installed:
+        return {"error": "no hook on NIS's main thread: run the MCPServer job in NIS"}
+    if _nd_run is not None:
+        return {"error": "an ND run holds NIS; capture refused"}
+    include_stats = args.get("include_stats", False)
+    if not isinstance(include_stats, bool):
+        return {"error": "include_stats must be a boolean"}
     path = CAPTURE_DIR / f"{stem}.nd2"
     if path.exists():
         return {"error": f"{path} already exists - refusing to overwrite"}
     path.parent.mkdir(parents=True, exist_ok=True)
-    with nis().held() as m:
-        def on_main_thread() -> dict:
-            if (r := _stopped("capture")):          # re-check: the call may have waited in the queue
-                return r
-            imaging = m.imaging()
-            rc_capture = m.Capture()
-            rc_save = m.ImageSaveAs(str(path), ND2_ALL_LAYERS, 0)
-            try:                                    # the file is saved: stats must not lose it
-                stats = m.image_stats(IMAGE_SAMPLE_GRID)
-            except Exception as e:
-                stats = {"error": f"could not read the image: {type(e).__name__}: {e}"}
-            rc_close = m.CloseCurrentDocument(QUERYSAVE_NO)
-            return {"path": str(path), "saved": path.exists(), "image": stats, "imaging": imaging,
-                    "rc_capture": rc_capture, "rc_save": rc_save, "rc_close": rc_close}
-        out = _ui.call(on_main_thread, timeout_s=300)
-    if out.get("saved") is False:
-        out["error"] = "NIS did not save the file"
-    if (w := signal_warnings(out.get("image", {}))):
-        out["warnings"] = w
-    return out
+    with _capture_guard:
+        progress = _capture_snapshot()
+        if progress["capture_in_progress"]:
+            return {"error": "another capture is still queued/running; do not retry", "capture": progress}
+        now = time.monotonic()
+        job = {"capture_id": uuid.uuid4().hex, "state": "queued", "phase": "queued",
+               "path": str(path), "started_mono": now, "phase_started_mono": now,
+               "queue_deadline": now + CAPTURE_QUEUE_TIMEOUT_S, "timings_s": {}}
+        _capture_job = job
+        _capture_event(job, "capture_queued", path=str(path), include_stats=include_stats)
+
+    def on_main_thread() -> dict:
+        with _capture_guard:
+            if job["state"] != "queued":  # cancelled/expired while waiting: never start it late
+                return job["result"]
+            if time.monotonic() >= job["queue_deadline"]:
+                return _capture_finish(job, {"error": "capture expired in the UI queue; no acquisition was started"},
+                                       "cancelled")
+            job["state"] = "running"
+            job["timings_s"]["queue_wait"] = round(time.monotonic() - job["started_mono"], 6)
+        out = {"path": str(path), "saved": False}
+        try:
+            # Ownership is held by the actual UI operation, not the HTTP waiter.
+            # Returning progress or a client disconnect must not release it.
+            with contextlib.ExitStack() as operation_scope:
+                with _capture_phase(job, "wait_nis"):
+                    m = operation_scope.enter_context(nis().held())
+                if (r := _stopped("capture")):
+                    return _capture_finish(job, r, "cancelled")
+                if path.exists():
+                    return _capture_finish(job, {"error": "output appeared while queued; refusing to overwrite"}, "failed")
+                with _capture_phase(job, "read_imaging"):
+                    if m.ND_IsInExperimentCapture():
+                        raise RuntimeError("NIS is already acquiring an ND experiment")
+                    out["imaging"] = m.imaging()
+                with _capture_phase(job, "acquire"):
+                    out["rc_capture"] = m.Capture()
+                # E-stop blocks new acquisitions, not preservation of an image
+                # already acquired. Do not promise cancellation of native Capture().
+                with _capture_phase(job, "save"):
+                    out["rc_save"] = m.ImageSaveAs(str(path), ND2_ALL_LAYERS, 0)
+                    out["saved"] = path.is_file() and path.stat().st_size > 0
+                    if not out["saved"]:
+                        raise RuntimeError("NIS did not save the file; current document left open")
+                if include_stats:
+                    with _capture_phase(job, "statistics"):
+                        try:
+                            out["image"] = m.image_stats(IMAGE_SAMPLE_GRID)
+                        except Exception as e:
+                            out["image"] = {"error": f"could not read the image: {type(e).__name__}: {e}"}
+                    if (warnings := signal_warnings(out["image"])):
+                        out["warnings"] = warnings
+                else:
+                    out["statistics_skipped"] = True
+                with _capture_phase(job, "close"):
+                    out["rc_close"] = m.CloseCurrentDocument(QUERYSAVE_NO)
+            return _capture_finish(job, out, "completed")
+        except Exception as e:
+            out["error"] = f"{type(e).__name__}: {e}"
+            out["failed_phase"] = job["phase"]
+            return _capture_finish(job, out, "failed")
+
+    try:
+        box = _ui.submit(on_main_thread)
+    except Exception as e:
+        return _capture_finish(job, {"error": f"could not queue capture: {e}"}, "failed")
+    try:
+        return box.get(timeout=CAPTURE_RESPONSE_WAIT_S)
+    except queue.Empty:
+        # This is not cancellation. The operation remains reserved and queryable.
+        out = _capture_snapshot()
+        if not out["capture_in_progress"]:
+            return out["result"]
+        out["note"] = "capture is pending; poll capture_status with capture_id; do not submit another capture"
+        return out
 
 
 def imaging_status(args: dict) -> dict:
+    progress = _capture_snapshot()
+    if progress["capture_in_progress"]:
+        return {"capture_in_progress": True, "capture": progress,
+                "estop_engaged": estop_engaged(), "note": "imaging state is not read during capture"}
     if _nd_run is not None:
         return {"error": "an ND run holds NIS until it ends; status reports the run", "nd_running": True}
     with nis().held() as m:
@@ -805,13 +969,22 @@ TOOLS = [
     ({"name": "capture",
       "description": "Capture one image with the optical configuration active in NIS and save it as ND2 "
                      "in the capture folder. 'filename' is a plain name such as \"aml18_check\", no "
-                     "folders; .nd2 is added. An existing file is never overwritten. Returns the path, "
-                     "the imaging state it was taken with, and the image's size and per-channel "
-                     "intensity (min/max/mean/percentiles/saturation, from a sample of pixels). "
-                     "'warnings' flags a nearly blank or saturated image: a saved file is not "
-                     "necessarily a useful image, but a real sample can also be dark.",
-      "inputSchema": _schema(filename=_STRING)},
+                     "folders; .nd2 is added. An existing file is never overwritten. A slow capture "
+                     "returns queued/running with a capture_id: poll capture_status, never retry it. "
+                     "Completion returns the path, imaging state and phase timings. include_stats "
+                     "defaults to false to avoid per-pixel UI work; true adds sampled intensities and "
+                     "low-signal/saturation warnings. A saved file does not establish useful signal. "
+                     "Native acquisition can still occupy NIS's UI; returning progress does not abort it.",
+      "inputSchema": {"type": "object", "properties": {
+          "filename": _STRING, "include_stats": {"type": "boolean", "default": False}},
+          "required": ["filename"]}},
      capture),
+    ({"name": "capture_status",
+      "description": "Read-only cached progress/result of the current or last capture. Optional "
+                     "capture_id must match that operation. Reports phase, elapsed seconds, timings "
+                     "and terminal result without entering NIS. Pending is not failure or cancellation.",
+      "inputSchema": {"type": "object", "properties": {"capture_id": _STRING}}},
+     capture_status),
     ({"name": "list_experiments",
       "description": "Read-only: the ND experiments saved in NIS's ND Acquisition window, with the loops "
                      "each one uses (time, xy_points, z_stack, lambda, large_image), its time-lapse "
@@ -867,7 +1040,12 @@ def call_tool(name: str, args: dict) -> dict:
     fn = dict((t["name"], f) for t, f in TOOLS)[name]       # KeyError: unknown tool
     t0 = time.time()
     try:
-        out = fn(args)
+        progress = _capture_snapshot()
+        if progress["capture_in_progress"] and name not in (
+                "capture_status", "status", "imaging_status", "echo", "estop", "list_experiments"):
+            out = {"error": "capture is still queued/running; NIS operations are blocked", "capture": progress}
+        else:
+            out = fn(args)
     except Exception as e:
         out = {"error": f"{type(e).__name__}: {e}"}
     _log(name, args, out, time.time() - t0)
@@ -992,6 +1170,8 @@ def watch(srv: http.server.ThreadingHTTPServer, run_args: tuple) -> None:
         now = stamp()
         if now is None or now == seen:
             continue
+        if _capture_snapshot()["capture_in_progress"]:
+            continue                    # never discard ownership/state of an active native acquisition
         time.sleep(0.5)                 # let the editor finish writing
         if stamp() != now:
             continue                    # still changing: look again
