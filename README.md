@@ -33,7 +33,7 @@ The limits are constants at the top of `NISMCPServer.py`: edit and save.
 
 | Constant | What it limits |
 |---|---|
-| `XY_LIMITS_UM` | the XY area the stage may not leave, `((x_min, x_max), (y_min, y_max))` in um as `status` reports it; `None` refuses every move. **Now a temporary +-2 mm around (-2102, -1600): set the real safe area for your holder before a sample goes on** (move to its edges in NIS and read `status`) |
+| `XY_LIMITS_UM` | the XY area the stage may not leave, `((x_min, x_max), (y_min, y_max))` in um as `status` reports it; `None` refuses every move. Current recorded travel endpoints: X -57047.0 to +57047.0 um, Y -37547.0 to +37547.0 um; applied at the operator's request on 2026-11-17. These endpoints do not establish sample/objective clearance throughout the rectangle; reassess when the setup changes |
 | `MAX_STEP_UM` | the largest XY step per call (1000 um) |
 | `ALLOWED_MAGNIFICATIONS` | the objectives that can be selected (4x, 10x) |
 | `MAX_ND_RUN_S` | the longest time-lapse `run_experiment` starts (30 min); start longer runs in NIS |

@@ -71,10 +71,11 @@ MAX_STEP_UM = 1000.0            # largest XY step per call, per axis
 MAX_Z_DOWN_UM = 200.0           # largest focus_down step per call
 Z_MIN_UM = 0.0
 # The XY area moves may not leave, ((x_min, x_max), (y_min, y_max)) in um, as
-# status reports the stage. None refuses every move. TEMPORARY: +-2 mm around
-# where the stage was on 2026-11-03 with no sample; measure the real safe
-# area for the holder in use (move there in NIS, read status) and set it here.
-XY_LIMITS_UM = ((-4102.4, -102.4), (-3599.5, 400.5))
+# status reports the stage. None refuses every move. Endpoints recorded by
+# manual stage movement on 2026-11-17; applied at the operator's request.
+# These are tested travel endpoints, not a guarantee of sample/objective
+# clearance throughout the rectangle. Reassess when the holder/setup changes.
+XY_LIMITS_UM = ((-57047.0, 57047.0), (-37547.0, 37547.0))
 CAPTURE_DIR = Path.home() / "nis-mcp" / "captures"
 IMAGE_SAMPLE_GRID = 64          # capture reads a 64 x 64 grid of pixels for its intensity stats
 CAPTURE_RESPONSE_WAIT_S = 1.0   # return progress rather than hold HTTP open for a slow acquisition
