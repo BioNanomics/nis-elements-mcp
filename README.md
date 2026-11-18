@@ -524,10 +524,20 @@ Nikon and NIS-Elements are trademarks of Nikon Corporation.
    It backs the database up next to it first. Run it again to update the job.
 2. In NIS, reopen JOBS (or restart NIS) and run the `MCPServer` job. The job
    finishes at once; the server keeps running.
-3. Register it with Claude Code, once:
-   ```powershell
-   claude mcp add --transport http nis http://127.0.0.1:8767/mcp
-   ```
+3. Register it with your agent, once (NIS must be running the `MCPServer`
+   job for the tools to work):
+   - **Codex** (app or CLI): add to `%USERPROFILE%\.codex\config.toml`
+     ```toml
+     [mcp_servers.nis-elements-mcp]
+     enabled = true
+     url = "http://127.0.0.1:8767/mcp"
+     ```
+     then restart Codex.
+   - **Claude Code**:
+     ```powershell
+     claude mcp add --transport http --scope user nis http://127.0.0.1:8767/mcp
+     ```
+     then start a new session.
 
 ## Upgrade
 
