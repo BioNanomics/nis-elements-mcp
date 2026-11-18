@@ -12,7 +12,7 @@ the PC besides NIS: the server uses only the standard library.
 | `status` | stage XY and Z, objective, nosepiece, ND run state, e-stop state, safe XY area (read-only) |
 | `move_relative` | XY move from where the stage is, at most 1000 um per axis, never out of the safe XY area |
 | `focus_down` | lowers the objective (away from the sample) by at most 200 um; nothing raises it: a person does, watching the gap |
-| `change_objective` | turns the nosepiece and switches NIS's calibration; 4x and 10x only; reports primary-Z readbacks around each phase and rechecks E-stop before each command, without restoring Z |
+| `change_objective` | turns the nosepiece and switches NIS's calibration; 4x and 10x, and the 60x oil objective (see below); reports primary-Z readbacks around each phase and rechecks E-stop before each command, without restoring Z |
 | `list_optical_configs` | the optical configurations defined in NIS (read-only) |
 | `select_optical_config` | selects a saved configuration on the main thread; changes devices and may move the objective. Study configurations are selected/reviewed manually in NIS; using this tool requires an explicitly authorized configuration change |
 | `imaging_status` | active saved configuration names, separate objective/camera name readbacks, light path, shutters, logical analyzer state and PFS status (read-only; names do not establish hardware readiness) |
@@ -24,7 +24,9 @@ the PC besides NIS: the server uses only the standard library.
 | `estop` | `engage` creates the e-stop file `~/.nis-mcp/ESTOP`; `status` reports it |
 
 While the e-stop file exists, every move, objective change, capture and ND
-run is refused. Only a person releases it, by deleting the file:
+run is refused. ND runs longer than `MAX_ND_RUN_S` (30 min), including the
+study's 60-minute and 7.5-hour templates, are started from the NIS window;
+the server is used for the checks before them. Only a person releases it, by deleting the file:
 ```powershell
 Remove-Item ~\.nis-mcp\ESTOP
 ```
@@ -36,7 +38,9 @@ The limits are constants at the top of `NISMCPServer.py`: edit and save.
 |---|---|
 | `XY_LIMITS_UM` | the XY area the stage may not leave, `((x_min, x_max), (y_min, y_max))` in um as `status` reports it; `None` refuses every move. Current recorded travel endpoints: X -57047.0 to +57047.0 um, Y -37547.0 to +37547.0 um; applied at the operator's request on 2026-11-17. These endpoints do not establish sample/objective clearance throughout the rectangle; reassess when the setup changes |
 | `MAX_STEP_UM` | the largest XY step per call (1000 um) |
-| `ALLOWED_MAGNIFICATIONS` | the objectives that can be selected (4x, 10x) |
+| `ALLOWED_MAGNIFICATIONS` | the dry objectives that can be selected (4x, 10x); also the only magnifications `select_optical_config` accepts |
+| `OIL_MAGNIFICATIONS` | oil objectives `change_objective` may turn to, only when the nosepiece name says "oil" (60x) |
+| `OIL_CLEARANCE_UM` | how far Z is lowered before the turret turns to or from an oil objective (200 um); it is never raised again here |
 | `MAX_ND_RUN_S` | the longest time-lapse `run_experiment` starts (30 min); start longer runs in NIS |
 | `ALLOWED_EXPERIMENTS` | if it lists names, only those ND experiments run |
 | `CAPTURE_DIR` | where captures go (`~/nis-mcp/captures`) |
@@ -45,6 +49,33 @@ The limits are constants at the top of `NISMCPServer.py`: edit and save.
 
 Every tool call is logged as one JSON line in `~/nis-mcp/log.jsonl`: time,
 tool, arguments, result, refusals included.
+
+## 60x oil objective (0.10.0, not yet validated on the microscope)
+
+`change_objective` may turn to the 60x oil objective, and back to 4x/10x,
+under these rules. The 100x oil objective and any dry 60x remain refused.
+
+1. **A person confirms each change.** Turning to or from an oil objective is
+   refused unless the call passes `operator_confirmed: true`. The client sets
+   it only after the person at the microscope says, for that change, that
+   they are present, the sample is seated, and (going to oil) oil is on the
+   front lens. It is not a standing permission.
+2. **Z goes down first.** Before the turret turns, Z is lowered by
+   `OIL_CLEARANCE_UM` (200 um). The change is refused if that would go below
+   `Z_MIN_UM`, and the turret is not turned if the Z readback did not drop by
+   the full clearance (within 1 um). The result reports `oil_clearance`.
+3. **Z is never raised here.** After the change the objective stays lowered;
+   the person raises it to focus while watching the oil contact the dish.
+4. **E-stop is rechecked** before the Z move and again before the turret.
+5. **Configurations cannot leave oil.** `select_optical_config` still accepts
+   only 4x/10x configurations. While an oil objective is in place it refuses
+   a configuration naming another magnification, and if a selection moves the
+   turret off oil anyway the e-stop is engaged.
+
+Before relying on it, validate on the microscope with a person present:
+confirmation refusal, 10x -> 60x with the 200 um drop, manual refocus,
+60x -> 10x with the drop, and the e-stop refusal. 200 um has not been checked
+against this stage, dish and objective set.
 
 ## 0.9.1 checks (2026-11-18)
 

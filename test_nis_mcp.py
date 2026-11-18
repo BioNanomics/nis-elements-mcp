@@ -445,6 +445,110 @@ def test_change_objective_refusals(scope):
     assert scope.calls == []
 
 
+OIL_60 = "Plan Apo 60x Oil"
+
+
+@pytest.fixture
+def oil_scope(scope):
+    scope.names = {0: "Plan Apo 20x", 1: "Plan Fluor 4x", 2: "Plan Apo 10x", 3: OIL_60, 4: "Plan Apo 100x Oil"}
+    return scope
+
+
+def test_oil_objective_needs_operator_confirmation(oil_scope):
+    for confirmed in ({}, {"operator_confirmed": False}):
+        out, err = tool("change_objective", name="60x", **confirmed)
+        assert err and "operator_confirmed" in out["error"] and "oil is on the front lens" in out["error"]
+    out, err = tool("change_objective", name="60x", operator_confirmed="yes")
+    assert err and "true or false" in out["error"]
+    assert oil_scope.calls == [] and oil_scope.z == 4619.0
+
+
+def test_oil_objective_lowers_z_before_turning(oil_scope):
+    out, err = tool("change_objective", name="60x", operator_confirmed=True)
+    assert not err and out["objective"] == OIL_60 and out["change_completed"]
+    assert oil_scope.calls == [("z", -server.OIL_CLEARANCE_UM), ("turn", 3), ("calibrate", OIL_60)]
+    assert out["oil_clearance"] == {"z_before_um": 4619.0, "z_after_um": 4419.0, "rc": 1,
+                                    "requested_down_um": server.OIL_CLEARANCE_UM}
+    assert out["explicit_focus_command_issued"] and "a person raises it" in out["z_note"]
+    assert oil_scope.z == 4419.0                         # left lowered: never raised here
+
+
+def test_leaving_oil_also_needs_confirmation_and_lowers_z(oil_scope):
+    oil_scope.pos, oil_scope.cal = 3, OIL_60
+    out, err = tool("change_objective", name="10x")
+    assert err and "from an oil objective" in out["error"] and oil_scope.calls == []
+    out, err = tool("change_objective", name="10x", operator_confirmed=True)
+    assert not err and out["objective"] == "Plan Apo 10x"
+    assert oil_scope.calls == [("z", -server.OIL_CLEARANCE_UM), ("turn", 2), ("calibrate", "Plan Apo 10x")]
+
+
+def test_oil_lens_at_the_turret_counts_even_if_nis_names_another(oil_scope):
+    oil_scope.pos, oil_scope.cal = 3, "Plan Apo 10x"     # turret on oil, NIS calibrated to 10x
+    out, err = tool("change_objective", name="Plan Fluor 4x")
+    assert err and "oil objective" in out["error"] and oil_scope.calls == []
+
+
+def test_dry_changes_do_not_move_z(oil_scope):
+    out, err = tool("change_objective", name="10x", operator_confirmed=True)
+    assert not err and "oil_clearance" not in out
+    assert oil_scope.calls == [("turn", 2), ("calibrate", "Plan Apo 10x")]
+
+
+def test_oil_refusals(oil_scope):
+    out, err = tool("change_objective", name="100x", operator_confirmed=True)
+    assert err and "only 4x/10x" in out["error"]
+    oil_scope.names[3] = "Plan Apo 60x"                  # a dry 60x
+    out, err = tool("change_objective", name="60x", operator_confirmed=True)
+    assert err and "not an oil objective" in out["error"]
+    assert oil_scope.calls == []
+
+
+def test_oil_change_refused_below_z_min(oil_scope):
+    oil_scope.z = server.Z_MIN_UM + server.OIL_CLEARANCE_UM - 1
+    out, err = tool("change_objective", name="60x", operator_confirmed=True)
+    assert err and "Z_MIN_UM" in out["error"] and oil_scope.calls == []
+
+
+def test_oil_change_does_not_turn_when_z_does_not_go_down(oil_scope):
+    oil_scope.StgMoveZ = lambda dz, rel: 1               # accepts, never moves
+    out, err = tool("change_objective", name="60x", operator_confirmed=True)
+    assert err and "turret was not turned" in out["error"] and not out["changed"]
+    assert oil_scope.calls == [] and oil_scope.pos == 1
+
+
+def test_oil_change_stops_after_z_when_estop_engaged(oil_scope):
+    real = oil_scope.StgMoveZ
+
+    def move_then_stop(dz, rel):
+        server.ESTOP.write_text("")
+        return real(dz, rel)
+
+    oil_scope.StgMoveZ = move_then_stop
+    out, err = tool("change_objective", name="60x", operator_confirmed=True)
+    assert err and out["estop_engaged"]
+    assert oil_scope.calls == [("z", -server.OIL_CLEARANCE_UM)] and oil_scope.pos == 1
+
+
+def test_select_optical_config_refuses_leaving_oil(oil_scope, main_thread):
+    oil_scope.pos, oil_scope.cal = 3, OIL_60
+    oil_scope.opt_confs = ["AX", "Nikon AX:DIC_10x"]
+    out, err = tool("select_optical_config", name="Nikon AX:DIC_10x")
+    assert err and "oil objective" in out["error"] and oil_scope.calls == []
+
+
+def test_select_optical_config_engages_estop_when_it_leaves_oil(oil_scope, main_thread):
+    oil_scope.pos, oil_scope.cal = 3, OIL_60
+    oil_scope.select_turns_to = 2                        # names no lens, but turns to the 10x
+    out, err = tool("select_optical_config", name="AX")
+    assert err and out["estop_engaged"] and server.estop_engaged()
+
+
+def test_select_optical_config_still_refuses_60x_configurations(oil_scope, main_thread):
+    oil_scope.opt_confs = ["Eye Piece:DIC60x"]
+    out, err = tool("select_optical_config", name="Eye Piece:DIC60x")
+    assert err and "objective" in out["error"] and oil_scope.calls == []
+
+
 def test_change_objective_reports_a_turret_that_does_not_arrive(scope, monkeypatch):
     monkeypatch.setattr(server, "TURRET_SETTLE_S", 0.3)
     scope.Stg_SetNosepiecePosition = lambda i: 1         # accepts, never moves

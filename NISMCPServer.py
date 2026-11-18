@@ -21,7 +21,9 @@ except ImportError:          # off the microscope (tests, python NISMCPServer.py
 #   * Z only goes down (focus_down: away from the sample), MAX_Z_DOWN_UM per call;
 #     nothing here raises the objective
 #   * objective changes only to ALLOWED_MAGNIFICATIONS (4x/10x, whose
-#     working distances cannot reach the dish)
+#     working distances cannot reach the dish), or to an OIL_MAGNIFICATIONS
+#     oil objective (60x) when a person confirms; turning to or from oil
+#     first lowers Z by OIL_CLEARANCE_UM and never raises it
 #   * captures go only into CAPTURE_DIR, by plain file name, never overwriting
 #   * ND runs only of experiments saved in NIS (ND_STORED), and only of
 #     ALLOWED_EXPERIMENTS when it lists any
@@ -61,11 +63,19 @@ from pathlib import Path
 
 HOST = "127.0.0.1"
 PORT = int(os.environ.get("NIS_MCP_PORT", "").strip() or 8767)
-NAME, VERSION = "nis-mcp-server", "0.9.1"
+NAME, VERSION = "nis-mcp-server", "0.10.0"
 WATCH_S = 1.0                   # how often to look for a changed file
 PROTOCOL_VERSIONS = ("2025-11-25", "2025-06-18", "2025-03-26")   # newest first
 
 ALLOWED_MAGNIFICATIONS = (4.0, 10.0)
+# Oil objectives change_objective may also turn to (only those named "oil").
+# Their working distance is short, so turning to or from one needs
+# operator_confirmed (a person at the scope, oil applied) and first lowers Z
+# by OIL_CLEARANCE_UM; Z is never raised here, a person raises it to focus.
+# select_optical_config stays limited to ALLOWED_MAGNIFICATIONS.
+OIL_MAGNIFICATIONS = (60.0,)
+OIL_CLEARANCE_UM = 200.0        # Z lowered before the turret turns to or from an oil objective
+OIL_CLEARANCE_TOLERANCE_UM = 1.0   # how short of the full clearance the Z readback may stop
 MAX_STEP_UM = 1000.0            # largest XY step per call, per axis
 # Z: on this inverted Ti2 a larger Z raises the objective towards the sample.
 # focus_down only lowers it (away from the sample), never below Z_MIN_UM.
@@ -493,6 +503,11 @@ def magnification(name: str) -> "float | None":
     return mags.pop() if len(mags) == 1 else None
 
 
+def is_oil(name: "str | None") -> bool:
+    """An oil-immersion objective, by its name ('PLAN APO 60x OIL')."""
+    return bool(name) and re.search(r"\boil\b", name, re.IGNORECASE) is not None
+
+
 def estop_engaged() -> bool:
     try:
         return ESTOP.exists()
@@ -617,11 +632,16 @@ def change_objective(args: dict) -> dict:
     name = args.get("name")
     if not isinstance(name, str) or not name:
         return {"error": "change_objective needs the objective's 'name'"}
+    confirmed = args.get("operator_confirmed", False)
+    if not isinstance(confirmed, bool):
+        return {"error": "operator_confirmed must be true or false"}
     if (r := _stopped("objective change")):
         return r
-    if magnification(name) not in ALLOWED_MAGNIFICATIONS:
+    if magnification(name) not in ALLOWED_MAGNIFICATIONS + OIL_MAGNIFICATIONS:
         allowed = "/".join(f"{m:g}x" for m in ALLOWED_MAGNIFICATIONS)
-        return {"error": f"only {allowed} objectives are allowed, got {name!r}"}
+        oil = "/".join(f"{m:g}x" for m in OIL_MAGNIFICATIONS)
+        return {"error": f"only {allowed} objectives, and {oil} oil objectives with operator_confirmed, "
+                         f"are allowed, got {name!r}"}
     with nis().held() as m:
         pos, before, names = m.turret()
         targets = [i for i, n in names.items() if n == name]
@@ -637,6 +657,38 @@ def change_objective(args: dict) -> dict:
         name = names[target]
         if pos == target and before == name:
             return {"objective": name, "changed": False}
+        mag = magnification(name)
+        if mag not in ALLOWED_MAGNIFICATIONS and not is_oil(name):
+            return {"error": f"{name!r} is not an oil objective; at {mag:g}x only oil objectives are allowed",
+                    "current": before, "nosepiece": names}
+        # Turning to or from oil: a person confirms, then Z goes down first.
+        # NIS's calibrated name and the lens at the turret position can
+        # disagree; either being oil counts as leaving oil.
+        clearance = None
+        if is_oil(name) or is_oil(before) or is_oil(names.get(pos)):
+            way = "to" if is_oil(name) else "from"
+            if confirmed is not True:
+                return {"error": f"turning {way} an oil objective needs operator_confirmed=true. Ask the person "
+                                 "at the microscope to confirm they are there, the sample is seated"
+                                 + (" and oil is on the front lens" if way == "to" else "")
+                                 + f". Z is first lowered {OIL_CLEARANCE_UM:g} um and left there; the person "
+                                   "raises it to focus.",
+                        "current": before, "target": name, "changed": False}
+            z0 = m.position()[2]
+            if z0 - OIL_CLEARANCE_UM < Z_MIN_UM:
+                return {"error": f"lowering Z {OIL_CLEARANCE_UM:g} um before the turret turns would go to "
+                                 f"{z0 - OIL_CLEARANCE_UM:g} um, below Z_MIN_UM {Z_MIN_UM:g}",
+                        "z_um": z0, "current": before, "changed": False}
+            if (r := _stopped("objective change")):
+                return r
+            rc_z = m.StgMoveZ(-OIL_CLEARANCE_UM, MOVE_RELATIVE)
+            z1 = m.position()[2]
+            clearance = {"z_before_um": z0, "z_after_um": z1, "rc": rc_z,
+                         "requested_down_um": OIL_CLEARANCE_UM}
+            if not z1 <= z0 - OIL_CLEARANCE_UM + OIL_CLEARANCE_TOLERANCE_UM:
+                return {"error": f"Z did not go down {OIL_CLEARANCE_UM:g} um, so the turret was not turned. "
+                                 "Check the Z drive in NIS",
+                        "oil_clearance": clearance, "objective": before, "changed": False}
         snapshots = {"before_turret": _primary_z_snapshot(m)}
         out = {"objective": before, "before": before, "changed": False,
                "nosepiece_position": pos, "rc": None, "rc_calibration": None,
@@ -645,6 +697,11 @@ def change_objective(args: dict) -> dict:
                "z_readbacks": snapshots, "explicit_focus_command_issued": False,
                "z_note": "Primary-Z readbacks can reflect native microscope compensation; "
                          "no explicit focus command or automatic Z restoration is issued here."}
+        if clearance:
+            out.update(oil_clearance=clearance, explicit_focus_command_issued=True,
+                       z_note=f"Z was lowered {OIL_CLEARANCE_UM:g} um before the turret turned (oil) and is "
+                              "left there: a person raises it to focus. Later primary-Z readbacks can also "
+                              "reflect native microscope compensation; no automatic Z restoration is issued.")
 
         def observed_result():
             def delta(first, last):
@@ -740,6 +797,13 @@ def select_optical_config(args: dict) -> dict:
         if name not in names:
             return {"error": f"no optical configuration is named {name!r}", "optical_configs": names}
         _, obj_before, _ = m.turret()
+        # On oil, a configuration that names another lens would turn the turret
+        # without the clearance change_objective gives: refuse it.
+        mags = {float(x) for x in _MAG.findall(name)}
+        if is_oil(obj_before) and mags and mags != {magnification(obj_before)}:
+            return {"error": f"the current objective {obj_before!r} is an oil objective and {name!r} names "
+                             "another magnification; use change_objective (operator_confirmed) to leave oil first",
+                    "objective": obj_before}
 
         def on_main_thread() -> dict:
             if (r := _stopped("optical configuration change")):
@@ -754,7 +818,8 @@ def select_optical_config(args: dict) -> dict:
         pos, obj_after, _ = m.turret()
         out.update(optical_config=name, objective_before=obj_before, objective=obj_after,
                    nosepiece_position=pos, imaging=m.imaging())
-    if obj_after != obj_before and magnification(obj_after) not in ALLOWED_MAGNIFICATIONS:
+    if obj_after != obj_before and (magnification(obj_after) not in ALLOWED_MAGNIFICATIONS
+                                    or is_oil(obj_after) or is_oil(obj_before)):
         estop({"action": "engage", "reason": f"selecting {name!r} changed the objective from "
                                              f"{obj_before!r} to {obj_after!r}"})
         out["error"] = (f"the configuration changed the objective to {obj_after!r}, which is not allowed "
@@ -1168,11 +1233,18 @@ TOOLS = [
       "inputSchema": _schema(down_um=_NUMBER)},
      focus_down),
     ({"name": "change_objective",
-      "description": "Turn the nosepiece to an objective and switch NIS's calibration to it. Only the 4x "
-                     "and 10x objectives are allowed. Give the objective's name exactly as on the "
-                     "nosepiece, or just its magnification ('10x') when one objective has it; "
-                     "a wrong or ambiguous name returns the list.",
-      "inputSchema": _schema(name=_STRING)},
+      "description": "Turn the nosepiece to an objective and switch NIS's calibration to it. The 4x and "
+                     "10x objectives are allowed, and the 60x oil objective. Turning to or from an oil "
+                     "objective needs operator_confirmed=true: set it only after the person at the "
+                     "microscope says, for this change, that they are there, the sample is seated and "
+                     "(going to oil) oil is on the front lens - never on your own judgement. Z is then "
+                     f"lowered {OIL_CLEARANCE_UM:g} um before the turret turns and left there; the person raises it to "
+                     "focus. Give the objective's name exactly as on the nosepiece, or just its "
+                     "magnification ('10x') when one objective has it; a wrong or ambiguous name "
+                     "returns the list.",
+      "inputSchema": {"type": "object",
+                      "properties": {"name": _STRING, "operator_confirmed": {"type": "boolean"}},
+                      "required": ["name"]}},
      change_objective),
     ({"name": "list_optical_configs",
       "description": "Read-only: the optical configurations defined in NIS. Select one with "
