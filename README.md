@@ -50,7 +50,7 @@ The limits are constants at the top of `NISMCPServer.py`: edit and save.
 Every tool call is logged as one JSON line in `~/nis-mcp/log.jsonl`: time,
 tool, arguments, result, refusals included.
 
-## 60x oil objective (0.10.0, not yet validated on the microscope)
+## 60x oil objective (0.10.0; dry checks passed, oil refocus not yet validated)
 
 `change_objective` may turn to the 60x oil objective, and back to 4x/10x,
 under these rules. The 100x oil objective and any dry 60x remain refused.
@@ -72,10 +72,29 @@ under these rules. The 100x oil objective and any dry 60x remain refused.
    a configuration naming another magnification, and if a selection moves the
    turret off oil anyway the e-stop is engaged.
 
-Before relying on it, validate on the microscope with a person present:
-confirmation refusal, 10x -> 60x with the 200 um drop, manual refocus,
-60x -> 10x with the drop, and the e-stop refusal. 200 um has not been checked
-against this stage, dish and objective set.
+### Microscope checks (2026-11-18, dry)
+
+0.10.0 was deployed to the live server (file SHA-256
+`1690c1f349e7cf1a5ea7c60268a4a7eb5b384793ebf3b0803748ba7ee9e050bb`;
+`initialize` reported version 0.10.0) with the operator present, the sample
+seated and no ND run. XY stayed (3530.5, 304.1) um throughout.
+
+| Step | Result | Evidence and limit |
+|---|---|---|
+| 1. `60x` without `operator_confirmed` | Passed: refused | "turning to an oil objective needs operator_confirmed=true"; 10x, position 1 and Z 2584.68 um unchanged |
+| 2. 10x -> 60x, confirmed | Passed for software operation | `oil_clearance` Z 2584.72 -> 2384.68 um (rc 1) before the turret; position 1 -> 3 (rc 1), `rc_calibration` 0, `change_completed` true. Turret-phase Z delta -0.10 um, calibration 0. Status afterwards Z 2384.58 um: not raised. **Run without oil**, although the confirmation stated oil was applied |
+| 3. Manual refocus with oil contact | Not tested | Skipped: raising a dry oil objective toward the dish risks contact. Whether 200 um is enough clearance, and how far Z is raised to reach oil contact, remain unmeasured |
+| 4. 60x -> 10x, confirmed, e-stop engaged | Passed: refused | "e-stop engaged ... objective change refused"; 60x, position 3 and Z 2384.60 um unchanged. The operator released the e-stop |
+| 5. 60x -> 10x, confirmed | Passed for software operation | `oil_clearance` Z 2384.60 -> 2184.60 um (rc 1) before the turret; position 3 -> 1 (rc 1), `rc_calibration` 0, `change_completed` true. Turret-phase Z delta -0.20 um. Status afterwards Z 2184.42 um: not raised |
+
+The session's MCP client kept the 0.9.1 tool schema after reconnecting, so
+steps 2, 4 and 5 were sent to the same server as direct JSON-RPC
+`tools/call` requests over HTTP; the server's checks and log are the same.
+`select_optical_config`'s oil rules are covered by the mock suite only.
+
+The server cannot tell whether oil is present: step 2 shows it relies on
+the person's confirmation. Before study use, repeat step 3 with oil and a
+sample, measuring the Z raise to oil contact against the 200 um clearance.
 
 ## 0.9.1 checks (2026-11-18)
 
