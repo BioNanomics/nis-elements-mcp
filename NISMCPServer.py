@@ -47,6 +47,7 @@ import datetime
 import http.server
 import importlib.util
 import json
+import math
 import os
 import queue
 import re
@@ -60,7 +61,7 @@ from pathlib import Path
 
 HOST = "127.0.0.1"
 PORT = int(os.environ.get("NIS_MCP_PORT", "").strip() or 8767)
-NAME, VERSION = "nis-mcp-server", "0.8.4"
+NAME, VERSION = "nis-mcp-server", "0.9.1"
 WATCH_S = 1.0                   # how often to look for a changed file
 PROTOCOL_VERSIONS = ("2025-11-25", "2025-06-18", "2025-03-26")   # newest first
 
@@ -88,6 +89,12 @@ LIGHT_PATH_NAMES: "dict[int, str]" = {}
 LOG_FILE = Path.home() / "nis-mcp" / "log.jsonl"   # one JSON line per tool call
 ALLOWED_EXPERIMENTS = ()        # saved ND experiment names; empty: any
 MAX_ND_RUN_S = 30 * 60.0        # longest time-lapse run_experiment starts (an ND run holds NIS)
+SELECT_CONFIG_TIMEOUT_S = 60.0  # how long select_optical_config waits for NIS's main thread
+# Stg_GetPFSStatus return values, from the NIS 6.20 macro reference (PFS)
+PFS_STATUS = {-1: "error (e.g. not connected)", 0: "off, in range", 1: "on, focused",
+              3: "off, out of range", 4: "off, out of range (PFS dichroic mirror out)",
+              5: "on, searching", 6: "on, search stopped: focus not found",
+              7: "disabled: objective not supported"}
 # where NIS keeps the saved ND experiments (the "AX Confocal" profile)
 ND_STORED = (Path(os.environ.get("PROGRAMDATA") or r"C:\ProgramData")
              / "Laboratory Imaging" / "Platform" / "AX Confocal" / "ND_Stored.bin")
@@ -145,6 +152,15 @@ class NIS:
         "Get_ImageInfo": [ct.c_wchar_p] + [ct.POINTER(ct.c_int)] * 4,
         "GetPixelValueEx": [ct.c_int, ct.c_int, ct.c_int, ct.c_int, ct.POINTER(ct.c_int)],
     }
+    # Bound when the DLL exports them; a missing one fails only the call that
+    # uses it (reported as a diagnostic or tool error), never server startup.
+    OPTIONAL_SIGNATURES = {
+        "SelectOptConf": [ct.c_wchar_p],
+        "Stg_IsAnalyzerPresent": [],
+        "Stg_GetAnalyzerState": [],
+        "Stg_IsPFSPresent": [],
+        "Stg_GetPFSStatus": [],
+    }
 
     # Installed x64 g5_new_ml.dll exports the documented camera getter using
     # C++ linkage: int __cdecl GetCurrentCameraName(wchar_t*). Do not call the
@@ -160,6 +176,12 @@ class NIS:
             dll = ct.cdll.g5_regprocs   # only loads inside nis_ar.exe
             for name, args in self.SIGNATURES.items():
                 getattr(dll, name).argtypes, getattr(dll, name).restype = args, ct.c_int
+            for name, args in self.OPTIONAL_SIGNATURES.items():
+                try:
+                    fn = getattr(dll, name)
+                except AttributeError:
+                    continue
+                fn.argtypes, fn.restype = args, ct.c_int
         self.dll = dll
 
     def __getattr__(self, name):
@@ -222,12 +244,22 @@ class NIS:
         config_rc = read_name("GetSelectedOptConf", obj, cam, mic, 255)
         objective_rc = read_name("GetCurrentObjName", objective)
         camera_rc = read_name("GetCurrentCameraName", camera)
+        # DIC analyzer and Perfect Focus: read-only; absent devices report None.
+        analyzer = None
+        if read_name("Stg_IsAnalyzerPresent") == 1:
+            st = read_name("Stg_GetAnalyzerState")
+            analyzer = {"state": "in" if st == 1 else "out" if st == 0 else f"unknown (rc {st})"}
+        pfs = None
+        if read_name("Stg_IsPFSPresent") == 1:
+            st = read_name("Stg_GetPFSStatus")
+            pfs = {"status": st, "meaning": PFS_STATUS.get(st, "unknown")}
         # Keep the original fields: these are saved configuration names, not
         # hardware identities. Raw return values have no assumed success code.
         out = {"optical_config": {"objective": obj.value, "camera": cam.value, "microscope": mic.value},
                "optical_config_rc": config_rc,
                "objective": objective.value or None, "objective_rc": objective_rc,
-               "camera_name": camera.value or None, "camera_name_rc": camera_rc}
+               "camera_name": camera.value or None, "camera_name_rc": camera_rc,
+               "analyzer": analyzer, "pfs": pfs}
         if errors:
             out["diagnostic_errors"] = errors
         if self.Stg_IsLightPathPresent() == 1:
@@ -568,6 +600,19 @@ def focus_down(args: dict) -> dict:
     return out
 
 
+def _primary_z_snapshot(m: NIS) -> dict:
+    """A diagnostic primary-Z read; never turn a failed/nonfinite read into zero."""
+    value = ct.c_double(float("nan"))
+    try:
+        rc = m.StgGetPosZ(ct.byref(value), 0)
+    except Exception as e:
+        return {"z_um": None, "rc": None, "valid": False,
+                "monotonic_s": time.monotonic(), "error": f"{type(e).__name__}: {e}"}
+    valid = rc == 1 and math.isfinite(value.value)
+    return {"z_um": round(value.value, 6) if valid else None, "rc": rc,
+            "valid": valid, "monotonic_s": time.monotonic()}
+
+
 def change_objective(args: dict) -> dict:
     name = args.get("name")
     if not isinstance(name, str) or not name:
@@ -592,38 +637,130 @@ def change_objective(args: dict) -> dict:
         name = names[target]
         if pos == target and before == name:
             return {"objective": name, "changed": False}
+        snapshots = {"before_turret": _primary_z_snapshot(m)}
+        out = {"objective": before, "before": before, "changed": False,
+               "nosepiece_position": pos, "rc": None, "rc_calibration": None,
+               "nosepiece_position_before": pos, "turret_position_changed": False,
+               "calibration_command_issued": False, "change_completed": False,
+               "z_readbacks": snapshots, "explicit_focus_command_issued": False,
+               "z_note": "Primary-Z readbacks can reflect native microscope compensation; "
+                         "no explicit focus command or automatic Z restoration is issued here."}
+
+        def observed_result():
+            def delta(first, last):
+                a, b = snapshots.get(first), snapshots.get(last)
+                return round(b["z_um"] - a["z_um"], 6) if a and b and a["valid"] and b["valid"] else None
+            out["z_deltas_um"] = {
+                "turret": delta("before_turret", "after_turret_before_calibration"),
+                "calibration": delta("after_turret_before_calibration", "after_calibration"),
+                "total": delta("before_turret", "after_calibration")}
+            return out
+
+        # Readbacks and the lock wait may have blocked after the first stop check.
+        if (r := _stopped("objective change")):
+            out.update(r)
+            return observed_result()
         # Both calls are needed (seen on the scope 2026-10-13/14):
         # Stg_SetNosepiecePosition turns the turret but leaves NIS's objective
         # and calibration alone; ChangeObjective switches those but not the
         # turret. Turn, wait for arrival, and only then tell NIS.
         rc = m.Stg_SetNosepiecePosition(target)
+        out["rc"] = rc
         deadline = time.time() + TURRET_SETTLE_S
         while rc == 1 and pos != target and time.time() < deadline:
             time.sleep(TURRET_POLL_S)
             pos = m.Stg_GetNosepiecePosition()
+            if estop_engaged():
+                break                          # no subsequent calibration after a stop
+        out["nosepiece_position"] = pos
+        out["turret_position_changed"] = pos != out["nosepiece_position_before"]
+        snapshots["after_turret_before_calibration"] = _primary_z_snapshot(m)
+        # A stop during turret settling or this Z read prevents the next mutation.
+        if (r := _stopped("objective calibration")):
+            out.update(r, objective=None, changed=None,
+                       note="The turret command was issued but calibration was not. "
+                            "The objective name after this partial change is not reported; "
+                            "inspect the nosepiece readbacks and verify in NIS.")
+            return observed_result()
         # ChangeObjective returned 0 on the scope (2026-11-03) when it did switch:
         # rc_calibration 0 is not a failure. Arrival is judged from the turret below.
-        rc_calibration = m.ChangeObjective(name) if pos == target else None
+        rc_calibration = None
+        if pos == target:
+            out["calibration_command_issued"] = True
+            rc_calibration = m.ChangeObjective(name)
+            snapshots["after_calibration"] = _primary_z_snapshot(m)
         pos, after, _ = m.turret()
-    out = {"objective": after, "before": before, "changed": after != before,
-           "nosepiece_position": pos, "rc": rc, "rc_calibration": rc_calibration}
+        out.update(objective=after, changed=after != before,
+                   nosepiece_position=pos, rc_calibration=rc_calibration,
+                   turret_position_changed=pos != out["nosepiece_position_before"],
+                   change_completed=pos == target and after == name)
     if pos != target or after != name:
         out["error"] = f"did not arrive at {name!r}"
-    return out
+    return observed_result()
+
+
+def _opt_conf_names(m: NIS) -> "list[str]":
+    names = []
+    for i in range(m.GetOptConfCount() + 1):            # index base unverified: try 0..n
+        b = ct.create_unicode_buffer(255)
+        m.GetOptConfName(i, b, 255)
+        if b.value and b.value not in names:
+            names.append(b.value)
+    return names
 
 
 def list_optical_configs(args: dict) -> dict:
-    names = []
     with nis().held() as m:
-        for i in range(m.GetOptConfCount() + 1):        # index base unverified: try 0..n
-            b = ct.create_unicode_buffer(255)
-            m.GetOptConfName(i, b, 255)
-            if b.value and b.value not in names:
-                names.append(b.value)
-    return {"optical_configs": names}
+        return {"optical_configs": _opt_conf_names(m)}
 
-# No select: SelectOptConf from a worker thread switched the devices and then
-# froze NIS's main thread (2026-10-15). Set the optical configuration in NIS.
+
+def select_optical_config(args: dict) -> dict:
+    # SelectOptConf from a worker thread switched the devices and then froze
+    # NIS's main thread (2026-10-15), so it runs on the main thread, like
+    # capture and the ND calls. A configuration can include an objective, so
+    # one that names a magnification outside ALLOWED_MAGNIFICATIONS is refused,
+    # and an objective change to a disallowed lens afterwards engages the e-stop.
+    name = args.get("name")
+    if not isinstance(name, str) or not name:
+        return {"error": "select_optical_config needs the configuration's 'name' (see list_optical_configs)"}
+    if (r := _stopped("optical configuration change")):
+        return r
+    named = {float(x) for x in _MAG.findall(name)} - set(ALLOWED_MAGNIFICATIONS)
+    if named:
+        allowed = "/".join(f"{x:g}x" for x in ALLOWED_MAGNIFICATIONS)
+        return {"error": f"{name!r} names a {min(named):g}x objective; a configuration may turn the "
+                         f"nosepiece, so only {allowed} configurations (or ones naming no objective) "
+                         "can be selected from here"}
+    if not _ui.installed:
+        return {"error": "no hook on NIS's main thread, which this call needs: run the MCPServer job in NIS"}
+    if _nd_run is not None:
+        return {"error": "an ND run holds NIS; optical configuration change refused"}
+    with nis().held() as m:
+        names = _opt_conf_names(m)
+        if name not in names:
+            return {"error": f"no optical configuration is named {name!r}", "optical_configs": names}
+        _, obj_before, _ = m.turret()
+
+        def on_main_thread() -> dict:
+            if (r := _stopped("optical configuration change")):
+                return r
+            if m.ND_IsInExperimentCapture():
+                return {"error": "NIS is acquiring an ND experiment; configuration change refused"}
+            return {"rc_select": m.SelectOptConf(name)}     # return value undocumented: reported only
+
+        out = _ui.call(on_main_thread, timeout_s=SELECT_CONFIG_TIMEOUT_S)
+        if "error" in out:
+            return out
+        pos, obj_after, _ = m.turret()
+        out.update(optical_config=name, objective_before=obj_before, objective=obj_after,
+                   nosepiece_position=pos, imaging=m.imaging())
+    if obj_after != obj_before and magnification(obj_after) not in ALLOWED_MAGNIFICATIONS:
+        estop({"action": "engage", "reason": f"selecting {name!r} changed the objective from "
+                                             f"{obj_before!r} to {obj_after!r}"})
+        out["error"] = (f"the configuration changed the objective to {obj_after!r}, which is not allowed "
+                        "here: e-stop engaged. A person checks the sample and releases it")
+        out["estop_engaged"] = True
+    return out
 
 
 def capture(args: dict) -> dict:
@@ -874,6 +1011,26 @@ def list_experiments(args: dict) -> dict:
             "file": str(ND_STORED), "file_written": written}
 
 
+def _nd_output_collision(acq: dict) -> "dict | None":
+    """Refuse an existing explicit saved target; no renaming, reservation or writes.
+
+    Missing legacy naming fields and native auto-numbering remain unverified.
+    This is a preflight check, not atomic protection against concurrent writers.
+    """
+    top = acq.get("NDAcquisitionTop", {})
+    if top.get("bSaveToFile") is False:
+        return None
+    folder, filename = top.get("sPath"), top.get("sFileName")
+    if not isinstance(folder, str) or not folder or not isinstance(filename, str) or not filename:
+        return None
+    path = Path(folder) / filename
+    if path.exists() or path.is_symlink():
+        return {"error": f"ND output already exists: {path}; choose a new filename in NIS. "
+                         "No acquisition was started and no output was overwritten.",
+                "output_path": str(path)}
+    return None
+
+
 def run_experiment(args: dict) -> dict:
     name = args.get("experiment")
     if not isinstance(name, str) or not name:
@@ -900,6 +1057,8 @@ def run_experiment(args: dict) -> dict:
                 "time_lapse_s": length}
     if (r := _stopped("ND run")):
         return r
+    if (r := _nd_output_collision(saved[name])):
+        return r
     global _nd_run
     with nis().held() as m:
         def on_main_thread() -> dict:
@@ -911,7 +1070,15 @@ def run_experiment(args: dict) -> dict:
             # value, and on the scope ND_LoadExperiment returned 0 for a
             # template that does load (2026-10-30). So the codes are reported,
             # not checked: NIS runs whatever the ND Acquisition window holds.
+            # Recheck after queue/lock waits before loading, then again after
+            # loading immediately before acquisition. Never auto-renumber NIS.
+            if (r := _nd_output_collision(saved[name])):
+                return r
             rc_load = m.ND_LoadExperiment(name)
+            if (r := _nd_output_collision(saved[name])):
+                return dict(r, rc_load=rc_load)
+            if (r := _stopped("ND run")):
+                return r
             t0 = time.time()
             rc_run = m.ND_RunExperiment(0)          # 0: save to disk, do not open
             return {"experiment": name, "rc_load": rc_load, "rc_run": rc_run,
@@ -1008,14 +1175,24 @@ TOOLS = [
       "inputSchema": _schema(name=_STRING)},
      change_objective),
     ({"name": "list_optical_configs",
-      "description": "Read-only: the optical configurations defined in NIS. None can be selected from "
-                     "here: set it in NIS before capture.",
+      "description": "Read-only: the optical configurations defined in NIS. Select one with "
+                     "select_optical_config before capture.",
       "inputSchema": _schema()},
      list_optical_configs),
+    ({"name": "select_optical_config",
+      "description": "Make a saved optical configuration active in NIS, by its exact name from "
+                     "list_optical_configs. Selecting one switches devices (light path, filters, "
+                     "shutters, lasers/lamp settings, possibly the objective), so tell the operator first. "
+                     "A configuration naming an objective other than 4x/10x is refused. Returns the "
+                     "objective before and after and the imaging state (light path, shutters, analyzer, "
+                     "PFS); check them before capture.",
+      "inputSchema": _schema(name=_STRING)},
+     select_optical_config),
     ({"name": "imaging_status",
       "description": "Read-only: active saved optical configuration names and their raw return value, "
                      "separate objective and camera name readbacks with raw return values/read errors, "
-                     "the light path port and shutter states. Names do not prove hardware readiness; "
+                     "the light path port, shutter states, DIC analyzer in/out and Perfect Focus status. "
+                     "Names do not prove hardware readiness; "
                      "live-view state is not read. Check it before capture.",
       "inputSchema": _schema()},
      imaging_status),

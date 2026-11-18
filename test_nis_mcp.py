@@ -57,7 +57,8 @@ def test_handshake_list_and_echo(url):
     assert post(url + "/mcp", {"jsonrpc": "2.0", "method": "notifications/initialized"})[0] == 202
     tools = post(url + "/mcp", {"jsonrpc": "2.0", "id": 2, "method": "tools/list"})[1]["result"]["tools"]
     assert [t["name"] for t in tools] == ["echo", "status", "move_relative", "focus_down", "change_objective",
-                                          "list_optical_configs", "imaging_status", "capture", "capture_status",
+                                          "list_optical_configs", "select_optical_config",
+                                          "imaging_status", "capture", "capture_status",
                                           "list_experiments",
                                           "run_experiment",
                                           "finish_experiment", "estop"]
@@ -301,6 +302,27 @@ class FakeScope:
     def Stg_GetShutterStateEx(self, name):
         return self.shutters[name]
 
+    analyzer_state, pfs_status = 0, 0
+    select_turns_to = None                  # a nosepiece position SelectOptConf also turns to
+
+    def Stg_IsAnalyzerPresent(self):
+        return 1
+
+    def Stg_GetAnalyzerState(self):
+        return self.analyzer_state
+
+    def Stg_IsPFSPresent(self):
+        return 1
+
+    def Stg_GetPFSStatus(self):
+        return self.pfs_status
+
+    def SelectOptConf(self, name):
+        if self.select_turns_to is not None:
+            self.pos = self.select_turns_to
+            self.cal = self.names[self.pos]
+        return self._record("select", name)
+
     def Get_ImageInfo(self, name, w, h, bits, planes):
         assert name == ""                   # the current image
         if self.image is None:
@@ -430,6 +452,94 @@ def test_change_objective_reports_a_turret_that_does_not_arrive(scope, monkeypat
     assert err and out["rc_calibration"] is None and scope.cal == "Plan Fluor 4x"   # NIS not told
 
 
+@pytest.mark.parametrize("phase", ["turret", "calibration"])
+@pytest.mark.parametrize("delta", [-0.32, 0.25])
+def test_change_objective_attributes_z_readback_change_without_restoring(scope, monkeypatch, phase, delta):
+    method = "Stg_SetNosepiecePosition" if phase == "turret" else "ChangeObjective"
+    original = getattr(scope, method)
+    before = scope.z
+
+    def native_change(*args):
+        rc = original(*args)
+        scope.z += delta
+        return rc
+
+    monkeypatch.setattr(scope, method, native_change)
+    out, err = tool("change_objective", name="10x")
+    assert not err and out["explicit_focus_command_issued"] is False
+    assert out["change_completed"] and out["calibration_command_issued"]
+    assert out["turret_position_changed"] and out["nosepiece_position_before"] == 1
+    assert scope.calls == [("turn", 2), ("calibrate", "Plan Apo 10x")]
+    assert scope.z == pytest.approx(before + delta)       # no corrective Z move
+    z = out["z_readbacks"]
+    assert list(z) == ["before_turret", "after_turret_before_calibration", "after_calibration"]
+    assert all(s["rc"] == 1 and s["valid"] for s in z.values())
+    assert z["before_turret"]["z_um"] == before
+    assert z["after_turret_before_calibration"]["z_um"] == pytest.approx(
+        before + delta if phase == "turret" else before)
+    assert z["after_calibration"]["z_um"] == pytest.approx(before + delta)
+    assert [s["monotonic_s"] for s in z.values()] == sorted(s["monotonic_s"] for s in z.values())
+    assert out["z_deltas_um"] == {"turret": delta if phase == "turret" else 0,
+                                   "calibration": delta if phase == "calibration" else 0,
+                                   "total": delta}
+
+
+@pytest.mark.parametrize("rc,value", [(-4, 2584.94), (1, float("nan")), (1, float("inf"))])
+def test_change_objective_marks_failed_or_nonfinite_z_unknown(scope, monkeypatch, rc, value):
+    def invalid_read(z, device):
+        assert device == 0
+        z._obj.value = value
+        return rc
+
+    monkeypatch.setattr(scope, "StgGetPosZ", invalid_read)
+    out, err = tool("change_objective", name="10x")
+    assert not err and not out["explicit_focus_command_issued"]
+    assert all(s["z_um"] is None and s["rc"] == rc and not s["valid"]
+               for s in out["z_readbacks"].values())
+    assert out["z_deltas_um"] == {"turret": None, "calibration": None, "total": None}
+    assert [c[0] for c in scope.calls] == ["turn", "calibrate"]
+
+
+@pytest.mark.parametrize("stop_at_read", [1, 2])
+def test_change_objective_rechecks_estop_after_z_read(scope, monkeypatch, stop_at_read):
+    read = scope.StgGetPosZ
+    reads = 0
+
+    def stop_during_read(z, device):
+        nonlocal reads
+        rc = read(z, device)
+        reads += 1
+        if reads == stop_at_read:
+            server.ESTOP.write_text("{}")
+        return rc
+
+    monkeypatch.setattr(scope, "StgGetPosZ", stop_during_read)
+    out, err = tool("change_objective", name="10x")
+    assert err and out["estop_engaged"] and out["rc_calibration"] is None
+    assert scope.calls == ([] if stop_at_read == 1 else [("turn", 2)])
+    assert not out["change_completed"] and not out["calibration_command_issued"]
+    if stop_at_read == 2:
+        assert out["objective"] is None and out["changed"] is None
+        assert out["turret_position_changed"]
+    assert len(out["z_readbacks"]) == stop_at_read
+    assert "after_calibration" not in out["z_readbacks"]
+    assert not server._nis.lock.locked()
+
+
+def test_change_objective_rechecks_estop_during_turret_settle(scope, monkeypatch):
+    # The native turn arrives normally; the stop appears during its polling
+    # pause, so calibration would happen without the command-boundary check.
+    monkeypatch.setattr(server.time, "sleep", lambda _: server.ESTOP.write_text("{}"))
+    out, err = tool("change_objective", name="10x")
+    assert err and out["estop_engaged"] and out["rc_calibration"] is None
+    assert scope.calls == [("turn", 2)]
+    assert out["nosepiece_position"] == 2
+    assert out["objective"] is None and out["changed"] is None
+    assert out["turret_position_changed"] and out["nosepiece_position_before"] == 1
+    assert not out["change_completed"] and not out["calibration_command_issued"]
+    assert scope.cal == "Plan Fluor 4x" and not server._nis.lock.locked()
+
+
 def test_status(scope):
     out, err = tool("status")
     assert not err and out == {"xy_um": [100.0, 200.0], "z_um": 4619.0, "objective": "Plan Fluor 4x",
@@ -482,6 +592,49 @@ def test_a_log_that_cannot_be_written_does_not_stop_a_tool(scope, monkeypatch):
 
 def test_list_optical_configs(scope):
     assert tool("list_optical_configs") == ({"optical_configs": ["All Devices", "AX", "EPI"]}, False)
+
+
+def test_select_optical_config_runs_on_the_main_thread(scope, main_thread):
+    out, err = tool("select_optical_config", name="AX")
+    assert not err and out["optical_config"] == "AX" and out["rc_select"] == 1
+    assert out["objective_before"] == out["objective"] == "Plan Fluor 4x"
+    assert out["imaging"]["analyzer"] == {"state": "out"}
+    assert out["imaging"]["pfs"] == {"status": 0, "meaning": "off, in range"}
+    assert scope.calls == [("select", "AX")]
+    assert scope.threads["select"] == main_thread.main_thread_id
+
+
+def test_select_optical_config_refusals(scope, main_thread):
+    scope.opt_confs = ["AX", "Nikon AX:DIC_20x", "Eye Piece:DIC60x"]
+    assert "needs the configuration" in tool("select_optical_config")[0]["error"]
+    out, err = tool("select_optical_config", name="nope")
+    assert err and out["optical_configs"] == scope.opt_confs
+    for name in ("Nikon AX:DIC_20x", "Eye Piece:DIC60x"):
+        out, err = tool("select_optical_config", name=name)
+        assert err and "objective" in out["error"], name
+    server.ESTOP.write_text("{}")
+    out, err = tool("select_optical_config", name="AX")
+    assert err and out["estop_engaged"]
+    assert scope.calls == []
+
+
+def test_select_optical_config_needs_the_main_thread(scope):
+    out, err = tool("select_optical_config", name="AX")
+    assert err and "main thread" in out["error"] and scope.calls == []
+
+
+def test_select_optical_config_engages_estop_on_a_disallowed_objective(scope, main_thread):
+    scope.select_turns_to = 0               # the configuration turns to the 20x
+    out, err = tool("select_optical_config", name="AX")
+    assert err and out["estop_engaged"] and out["objective"] == "Plan Apo 20x"
+    assert server.estop_engaged()
+
+
+def test_imaging_status_reports_analyzer_and_pfs(scope):
+    scope.analyzer_state, scope.pfs_status = 1, 1
+    out, err = tool("imaging_status")
+    assert not err and out["analyzer"] == {"state": "in"}
+    assert out["pfs"] == {"status": 1, "meaning": "on, focused"}
 
 
 def test_capture_runs_on_the_main_thread(scope, main_thread):
@@ -885,6 +1038,59 @@ def test_run_experiment_refuses_a_name_that_is_not_saved(scope, main_thread):
     server.ND_STORED.unlink()
     assert "cannot check the name" in tool("run_experiment", experiment="C. elegans 3h")[0]["error"]
     assert scope.calls == []
+
+
+def test_run_experiment_refuses_existing_explicit_output_before_load(scope, main_thread, tmp_path):
+    output = tmp_path / "existing.nd2"
+    original = b"existing acquisition must be preserved"
+    output.write_bytes(original)
+    write_nd_stored(server.ND_STORED, {"collision": experiment(file=(str(tmp_path), output.name))})
+    out, err = tool("run_experiment", experiment="collision")
+    assert err and "output already exists" in out["error"]
+    assert out["output_path"] == str(output) and output.read_bytes() == original
+    assert scope.calls == [] and server._nd_run is None
+
+
+def test_run_experiment_rechecks_output_after_native_load(scope, main_thread, tmp_path, monkeypatch):
+    output = tmp_path / "appeared.nd2"
+    write_nd_stored(server.ND_STORED, {"collision": experiment(file=(str(tmp_path), output.name))})
+    load = scope.ND_LoadExperiment
+
+    def load_then_other_writer(name):
+        rc = load(name)
+        output.write_bytes(b"appeared during native loading")
+        return rc
+
+    monkeypatch.setattr(scope, "ND_LoadExperiment", load_then_other_writer)
+    out, err = tool("run_experiment", experiment="collision")
+    assert err and "output already exists" in out["error"] and out["rc_load"] == 0
+    assert out["output_path"] == str(output)
+    assert output.read_bytes() == b"appeared during native loading"
+    assert scope.calls == [("nd_load", "collision")] and server._nd_run is None
+    assert not server._nis.lock.locked()
+
+
+def test_run_experiment_starts_when_explicit_output_is_absent(scope, main_thread, tmp_path):
+    output = tmp_path / "new.nd2"
+    write_nd_stored(server.ND_STORED, {"new": experiment(file=(str(tmp_path), output.name))})
+    out, err = tool("run_experiment", experiment="new")
+    assert not err and out["rc_load"] == 0
+    assert scope.calls == [("nd_load", "new"), ("nd_run",)]
+    assert not output.exists()                          # fake ND acquisition writes no raw data
+
+
+def test_run_experiment_rechecks_estop_after_native_load(scope, main_thread, monkeypatch):
+    load = scope.ND_LoadExperiment
+
+    def load_then_stop(name):
+        rc = load(name)
+        server.ESTOP.write_text("{}")
+        return rc
+
+    monkeypatch.setattr(scope, "ND_LoadExperiment", load_then_stop)
+    out, err = tool("run_experiment", experiment="e")
+    assert err and out["estop_engaged"]
+    assert scope.calls == [("nd_load", "e")] and server._nd_run is None
 
 
 def test_run_experiment_refuses_a_long_or_unclear_time_lapse(scope, main_thread):
