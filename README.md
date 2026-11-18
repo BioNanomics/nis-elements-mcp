@@ -12,9 +12,10 @@ the PC besides NIS: the server uses only the standard library.
 | `status` | stage XY and Z, objective, nosepiece, ND run state, e-stop state, safe XY area (read-only) |
 | `move_relative` | XY move from where the stage is, at most 1000 um per axis, never out of the safe XY area |
 | `focus_down` | lowers the objective (away from the sample) by at most 200 um; nothing raises it: a person does, watching the gap |
-| `change_objective` | turns the nosepiece and switches NIS's calibration; 4x and 10x only |
-| `list_optical_configs` | the optical configurations defined in NIS (read-only; select one in NIS) |
-| `imaging_status` | active saved optical configuration names and their raw return value, separate objective/camera name readbacks and diagnostic errors, light path and shutter states (read-only) |
+| `change_objective` | turns the nosepiece and switches NIS's calibration; 4x and 10x, and the 60x oil objective (see below); reports primary-Z readbacks around each phase and rechecks E-stop before each command, without restoring Z |
+| `list_optical_configs` | the optical configurations defined in NIS (read-only) |
+| `select_optical_config` | selects a saved configuration on the main thread; changes devices and may move the objective. Study configurations are selected/reviewed manually in NIS; using this tool requires an explicitly authorized configuration change |
+| `imaging_status` | active saved configuration names, separate objective/camera name readbacks, light path, shutters, logical analyzer state and PFS status (read-only; names do not establish hardware readiness) |
 | `capture` | one image with the active optical configuration, saved as ND2 in `~/nis-mcp/captures`, by plain file name, never overwriting. Returns promptly with a capture ID and queued/running state for a slow capture; fast captures can return their completed result. Per-phase timings are included. `include_stats=true` opts into sampled intensity statistics; they are skipped by default |
 | `capture_status` | cached progress/result for the current or last capture, optionally checked against `capture_id`; never enters NIS or waits for its UI |
 | `list_experiments` | the ND experiments saved in NIS, with each one's loops, time-lapse length (or "single pass"), interval/duration/frames, Z steps and output file (read-only) |
@@ -23,7 +24,9 @@ the PC besides NIS: the server uses only the standard library.
 | `estop` | `engage` creates the e-stop file `~/.nis-mcp/ESTOP`; `status` reports it |
 
 While the e-stop file exists, every move, objective change, capture and ND
-run is refused. Only a person releases it, by deleting the file:
+run is refused. ND runs longer than `MAX_ND_RUN_S` (30 min), including the
+study's 60-minute and 7.5-hour templates, are started from the NIS window;
+the server is used for the checks before them. Only a person releases it, by deleting the file:
 ```powershell
 Remove-Item ~\.nis-mcp\ESTOP
 ```
@@ -35,7 +38,9 @@ The limits are constants at the top of `NISMCPServer.py`: edit and save.
 |---|---|
 | `XY_LIMITS_UM` | the XY area the stage may not leave, `((x_min, x_max), (y_min, y_max))` in um as `status` reports it; `None` refuses every move. Current recorded travel endpoints: X -57047.0 to +57047.0 um, Y -37547.0 to +37547.0 um; applied at the operator's request on 2026-11-17. These endpoints do not establish sample/objective clearance throughout the rectangle; reassess when the setup changes |
 | `MAX_STEP_UM` | the largest XY step per call (1000 um) |
-| `ALLOWED_MAGNIFICATIONS` | the objectives that can be selected (4x, 10x) |
+| `ALLOWED_MAGNIFICATIONS` | the dry objectives that can be selected (4x, 10x); also the only magnifications `select_optical_config` accepts |
+| `OIL_MAGNIFICATIONS` | oil objectives `change_objective` may turn to, only when the nosepiece name says "oil" (60x) |
+| `OIL_CLEARANCE_UM` | how far Z is lowered before the turret turns to or from an oil objective (200 um); it is never raised again here |
 | `MAX_ND_RUN_S` | the longest time-lapse `run_experiment` starts (30 min); start longer runs in NIS |
 | `ALLOWED_EXPERIMENTS` | if it lists names, only those ND experiments run |
 | `CAPTURE_DIR` | where captures go (`~/nis-mcp/captures`) |
@@ -44,6 +49,81 @@ The limits are constants at the top of `NISMCPServer.py`: edit and save.
 
 Every tool call is logged as one JSON line in `~/nis-mcp/log.jsonl`: time,
 tool, arguments, result, refusals included.
+
+## 60x oil objective (0.10.0; dry checks passed, oil refocus not yet validated)
+
+`change_objective` may turn to the 60x oil objective, and back to 4x/10x,
+under these rules. The 100x oil objective and any dry 60x remain refused.
+
+1. **A person confirms each change.** Turning to or from an oil objective is
+   refused unless the call passes `operator_confirmed: true`. The client sets
+   it only after the person at the microscope says, for that change, that
+   they are present, the sample is seated, and (going to oil) oil is on the
+   front lens. It is not a standing permission.
+2. **Z goes down first.** Before the turret turns, Z is lowered by
+   `OIL_CLEARANCE_UM` (200 um). The change is refused if that would go below
+   `Z_MIN_UM`, and the turret is not turned if the Z readback did not drop by
+   the full clearance (within 1 um). The result reports `oil_clearance`.
+3. **Z is never raised here.** After the change the objective stays lowered;
+   the person raises it to focus while watching the oil contact the dish.
+4. **E-stop is rechecked** before the Z move and again before the turret.
+5. **Configurations cannot leave oil.** `select_optical_config` still accepts
+   only 4x/10x configurations. While an oil objective is in place it refuses
+   a configuration naming another magnification, and if a selection moves the
+   turret off oil anyway the e-stop is engaged.
+
+### Microscope checks (2026-11-18, dry)
+
+0.10.0 was deployed to the live server (file SHA-256
+`1690c1f349e7cf1a5ea7c60268a4a7eb5b384793ebf3b0803748ba7ee9e050bb`;
+`initialize` reported version 0.10.0) with the operator present, the sample
+seated and no ND run. XY stayed (3530.5, 304.1) um throughout.
+
+| Step | Result | Evidence and limit |
+|---|---|---|
+| 1. `60x` without `operator_confirmed` | Passed: refused | "turning to an oil objective needs operator_confirmed=true"; 10x, position 1 and Z 2584.68 um unchanged |
+| 2. 10x -> 60x, confirmed | Passed for software operation | `oil_clearance` Z 2584.72 -> 2384.68 um (rc 1) before the turret; position 1 -> 3 (rc 1), `rc_calibration` 0, `change_completed` true. Turret-phase Z delta -0.10 um, calibration 0. Status afterwards Z 2384.58 um: not raised. **Run without oil**, although the confirmation stated oil was applied |
+| 3. Manual refocus with oil contact | Not tested | Skipped: raising a dry oil objective toward the dish risks contact. Whether 200 um is enough clearance, and how far Z is raised to reach oil contact, remain unmeasured |
+| 4. 60x -> 10x, confirmed, e-stop engaged | Passed: refused | "e-stop engaged ... objective change refused"; 60x, position 3 and Z 2384.60 um unchanged. The operator released the e-stop |
+| 5. 60x -> 10x, confirmed | Passed for software operation | `oil_clearance` Z 2384.60 -> 2184.60 um (rc 1) before the turret; position 3 -> 1 (rc 1), `rc_calibration` 0, `change_completed` true. Turret-phase Z delta -0.20 um. Status afterwards Z 2184.42 um: not raised |
+
+The session's MCP client kept the 0.9.1 tool schema after reconnecting, so
+steps 2, 4 and 5 were sent to the same server as direct JSON-RPC
+`tools/call` requests over HTTP; the server's checks and log are the same.
+`select_optical_config`'s oil rules are covered by the mock suite only.
+
+The server cannot tell whether oil is present: step 2 shows it relies on
+the person's confirmation. Before study use, repeat step 3 with oil and a
+sample, measuring the Z raise to oil contact against the 200 um clearance.
+
+## 0.9.1 checks (2026-11-18)
+
+Objective changes report `z_readbacks` before the turret command, after
+turret settling/before calibration, and after calibration. Each includes
+primary-Z micrometres, the raw getter return code, validity and monotonic
+time; failed or nonfinite values are `null`. `z_deltas_um` separates the
+turret and calibration phases. No explicit focus command or automatic Z
+restoration is issued. A stop after the turret command is a partial change:
+`objective` and `changed` are then unknown, while nosepiece positions and
+`calibration_command_issued` describe what was observed or issued.
+
+`run_experiment` refuses an existing explicit saved output target before
+loading and immediately before running. It never renumbers files or changes
+NIS settings. This is a collision preflight, **not an atomic reservation**;
+it does not prove that `ND_LoadExperiment` loaded the intended definition.
+Legacy records without an explicit path/name remain unchecked for collision.
+
+The mock-only suite passed **82 tests, 1 deselected**, exit code 0, with
+zero JUnit failures/errors. Report: `test-reports/mock-20261118-140443-c298e8a3/`.
+An earlier run encountered a Windows loopback connection-aborted error;
+that test alone and both subsequent full runs passed.
+
+The operator's native **Save > New** made `MCP_Readiness_90s` visible in the
+saved experiment index. Its completed technical test produced five frames
+at 20.000 s intervals (native call approximately 86.6 s), with Z/XY loops
+disabled. This establishes the short-run path, not useful biological signal
+or overnight readiness. At the end of that check, 10x was selected, no ND
+run was active and the software E-stop was released; these are dated observations.
 
 ## Hardware validation results (2026-11-17)
 
@@ -214,9 +294,9 @@ rerun the full suite and save reports.
 |---|---|
 | Non-laser camera acquisition | Await the NIS-integrated camera. Set up a compatible transmitted-light brightfield/DIC camera path and verify a useful live image before a real capture |
 | Real capture with the updated code | Validate progress polling, phase timings, NIS responsiveness, ND2 readability, image quality and document handling on actual acquisition. Mock success does not establish these |
-| Optical configuration selection verification | Pending: the operator sees no optical configuration button highlighted, so blank active configuration names appear expected. Selecting a known configuration and checking its reported names is deferred because selection changes settings; no configuration was applied for this investigation |
+| Optical configuration selection verification | The 0.9 selection tool exists; study settings are selected/reviewed manually in NIS. A preset with no magnification in its name can still change objectives before the post-check, so that preflight gap remains unvalidated |
 | Imaging-state reporting | Camera-name binding via `g5_new_ml.dll` passed a live read-only check, returning `Nikon_Confocal_Ax`. Light-path port-name mapping and live-view reporting remain pending |
-| ND run and finish behavior | Successful runs, `finish_experiment`, busy-state reporting and actual timing remain unvalidated in this session. Do not run automatically as part of safety tests |
+| ND run and finish behavior | The 2026-11-18 short run passed as recorded above. Early termination through `finish_experiment` while the blocking run holds NIS remains unsupported; use native Finish. Longer-run behavior remains unvalidated |
 | Geometry and accuracy | Confirm clearance for the current holder/sample/objective and validate calibration, repeatability and image displacement as needed; endpoint readings and software readbacks alone do not establish these |
 
 ## E-stop preflight checks (0.8.4)
@@ -488,7 +568,7 @@ $LASTEXITCODE
 ```
 
 Exit code `0` means the tests passed; a nonzero code means a failure or
-setup problem. The last verified full run reported **63 passed, 1
+setup problem. The last verified full run reported **82 passed, 1
 deselected**; the deselected test reads actual NIS experiment settings.
 If optional MCP SDK dependencies are absent, that client test is skipped.
 
@@ -572,10 +652,16 @@ Never press the JOBS **Abort** button: it freezes NIS.
    everything if the file cannot be read. The format is undocumented: a NIS
    update could change it, and then `test_reads_this_pcs_saved_experiments`
    fails. NIS may write the file only when it saves its settings, so an
-   experiment saved a moment ago may not be listed yet. To narrow the
-   choice further, list names in `ALLOWED_EXPERIMENTS`.
-3. **The optical configuration cannot be selected** from here: choose it in
-   NIS before `capture`.
+    experiment saved a moment ago may not be listed yet. Native Save > New
+    refreshed this index successfully for the 2026-11-18 readiness test;
+    discovery is no longer blocked for that saved experiment. To narrow the
+    choice further, list names in `ALLOWED_EXPERIMENTS`.
+3. **Optical configuration selection changes hardware.** The 0.9
+    `select_optical_config` tool exists, but study settings are selected and
+    reviewed manually in NIS. Its name-based magnification check cannot
+    exclude an objective change hidden in an unlabeled configuration; the
+    post-check/e-stop occurs after such a change, not before it. This remains
+    an unvalidated preflight gap. A matching saved name is not optical readiness.
 4. **Updating from 0.3.0 by saving the file** leaves capture and the ND
    tools without the main-thread hook (0.3.0 reloads on its watcher thread).
    Run the `MCPServer` job once more; later saves keep the hook.
