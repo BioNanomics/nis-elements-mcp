@@ -292,12 +292,56 @@ rerun the full suite and save reports.
 
 | Still needs testing | Scope / prerequisite |
 |---|---|
-| Non-laser camera acquisition | Await the NIS-integrated camera. Set up a compatible transmitted-light brightfield/DIC camera path and verify a useful live image before a real capture |
+| Non-laser camera acquisition | The DS-Fi3 is integrated and one `Fi3 - DIA:BF` capture succeeded (see "DS-Fi3 camera" below). Still pending: a focused sample image, the DIC and fluorescence Fi3 configurations, exposure settings, and opening the ND2 file to check it |
 | Real capture with the updated code | Validate progress polling, phase timings, NIS responsiveness, ND2 readability, image quality and document handling on actual acquisition. Mock success does not establish these |
 | Optical configuration selection verification | The 0.9 selection tool exists; study settings are selected/reviewed manually in NIS. A preset with no magnification in its name can still change objectives before the post-check, so that preflight gap remains unvalidated |
-| Imaging-state reporting | Camera-name binding via `g5_new_ml.dll` passed a live read-only check, returning `Nikon_Confocal_Ax`. Light-path port-name mapping and live-view reporting remain pending |
+| Imaging-state reporting | Camera-name binding via `g5_new_ml.dll` passed live checks, returning `Nikon_Confocal_Ax` (2026-11-17) and `DS-Fi3_Camera_Color_SN_111177` (2026-11-25). The Fi3 configurations use light path port 0, which has no name in `LIGHT_PATH_NAMES` yet. Live-view reporting remains pending |
 | ND run and finish behavior | The 2026-11-18 short run passed as recorded above. Early termination through `finish_experiment` while the blocking run holds NIS remains unsupported; use native Finish. Longer-run behavior remains unvalidated |
 | Geometry and accuracy | Confirm clearance for the current holder/sample/objective and validate calibration, repeatability and image displacement as needed; endpoint readings and software readbacks alone do not establish these |
+
+## DS-Fi3 camera (checked 2026-11-25)
+
+A Nikon **DS-Fi3** colour camera is now connected and set up in NIS. No
+server code changed for it: the existing tools read and use it.
+
+**Connection.** Windows lists `Nikon DS-Fi3` (USB `VID_04B0&PID_7014`) with
+status OK. NIS's `Cameras.xml` names `CLxGrabberFi3Driver` as the last
+active camera.
+
+**Read-only check.** `imaging_status` returned:
+
+| Field | Value |
+|---|---|
+| `camera_name` | `DS-Fi3_Camera_Color_SN_111177` (`camera_name_rc: 0`) |
+| `optical_config` | `Fi3 - DIA:cam5` (`optical_config_rc: 0`) |
+| `objective` | `PLAN APO λD 10x OFN25 DIC N1` |
+| `light_path` | port 0 of 4 (no name mapped) |
+| `shutters` | DIA LED, AX and D-LEDI closed |
+| `analyzer`, `pfs` | out; status 3 (off, out of range) |
+
+`list_optical_configs` now returns 20 configurations. Seven use the Fi3:
+`Fi3 - DIA:DAPI`, `:GFP`, `:TRITC`, `:Cy5`, `:BF`, `:DIC10x` and `:cam5`.
+
+**Capture check (requested by the operator).** `select_optical_config` selected
+`Fi3 - DIA:BF` (`rc_select: 0`). The objective stayed at 10x, the light path
+stayed at port 0 and the DIA LED shutter opened. Then `capture` saved
+`fi3_bf_check.nd2`, with `include_stats: true`:
+
+| Item | Result |
+|---|---|
+| Return codes | `rc_capture: 0`, `rc_save: 0`, `rc_close: 0` |
+| Total time | 2.66 s (acquire 1.38 s, save 0.22 s, close 1.02 s); first response was `running`, then `capture_status` reported `completed` |
+| Image | 2880 x 2048, 8-bit, 3 channels (RGB) |
+| Channel means (p1 to p99) | 237.5 (227 to 241), 248.6 (242 to 251), 249.5 (244 to 252) out of 255 |
+| Saturated pixels | 0 of 4096 sampled, in each channel |
+
+Light reaches the Fi3 through port 0 in the brightfield configuration. The
+image is bright with very little contrast, as from an empty field or a sample
+out of focus. The field's content was not checked, and neither was whether a
+sample was in place. The ND2 file has not been opened outside NIS.
+
+Not yet checked: a focused image of a sample, the Fi3 DIC and fluorescence
+configurations, exposure and white-balance settings, and live-view state.
 
 ## E-stop preflight checks (0.8.4)
 
